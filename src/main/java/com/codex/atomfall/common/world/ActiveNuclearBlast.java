@@ -1024,7 +1024,7 @@ public final class ActiveNuclearBlast {
         BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
 
         for (ShockTarget t : targets) {
-            if (needsSurface) {
+            if (t.needsSurface) {
                 int surfaceY = this.initialSurface.getOrCapture(level, t.x, t.z);
                 int floorY = Math.max(level.getMinY() + 4, surfaceY - shockScourDepth(t.psi, t.radial, t.x, t.z));
                 int startY = surfaceY + 1;
@@ -1042,7 +1042,7 @@ public final class ActiveNuclearBlast {
                 }
                 surfaceSnaps.add(new SurfaceColumnSnapshot(t.x, t.z, t.radial, t.psi, surfaceY, floorY, states, thresholds));
             }
-            if (needsStructural) {
+            if (t.needsStructural) {
                 int terrainY = this.initialSurface.getOrCapture(level, t.x, t.z);
                 int roofY = level.getHeight(Heightmap.Types.WORLD_SURFACE, t.x, t.z) - 1;
                 int minY = structureScanMinY(level, t.x, t.z, terrainY, roofY, t.psi);
@@ -1515,6 +1515,9 @@ public final class ActiveNuclearBlast {
         for (Direction direction : HORIZONTAL) {
             int nx = x + direction.getStepX();
             int nz = z + direction.getStepZ();
+            if (!level.hasChunk(nx >> 4, nz >> 4)) {
+                continue;
+            }
             int ny = this.initialSurface.getOrCapture(level, nx, nz);
             pos.set(nx, ny, nz);
             BlockState neighbor = level.getBlockState(pos);
@@ -1773,6 +1776,14 @@ public final class ActiveNuclearBlast {
     private List<BlockEdit> computeStructureEdits(StructureColumnSnapshot snap) {
         List<BlockEdit> edits = new ArrayList<>();
         boolean treeColumn = hasTreeMaterial(snap);
+        if (treeColumn && shouldAnnihilateTreeColumn(snap)) {
+            appendTallColumnAnnihilationEdits(snap, edits, true);
+            return edits;
+        }
+        if (!treeColumn && shouldAnnihilateTallStructureColumn(snap)) {
+            appendTallColumnAnnihilationEdits(snap, edits, false);
+            return edits;
+        }
         if (treeColumn) {
             appendTreeDamageEdits(snap, edits);
         }
@@ -1827,6 +1838,70 @@ public final class ActiveNuclearBlast {
             }
         }
         return false;
+    }
+
+    private boolean shouldAnnihilateTreeColumn(StructureColumnSnapshot snap) {
+        int treeBlocks = 0;
+        int highest = Integer.MIN_VALUE;
+        int lowest = Integer.MAX_VALUE;
+        for (int y = snap.roofY; y >= snap.minY; y--) {
+            if (!isTreeMaterial(snap.stateAt(y))) {
+                continue;
+            }
+            treeBlocks++;
+            highest = Math.max(highest, y);
+            lowest = Math.min(lowest, y);
+        }
+        if (treeBlocks <= 0) {
+            return false;
+        }
+
+        double dynamicPsi = treeDynamicPsi(snap);
+        int treeSpan = highest - lowest + 1;
+        boolean severeZone = snap.radial <= this.geometry.shockSevereRadius() * 1.08D;
+        boolean tallOrDense = treeSpan >= 8 || treeBlocks >= 5;
+        return tallOrDense && (dynamicPsi >= 0.85D || severeZone);
+    }
+
+    private boolean shouldAnnihilateTallStructureColumn(StructureColumnSnapshot snap) {
+        int shellBlocks = 0;
+        int highest = Integer.MIN_VALUE;
+        int lowest = Integer.MAX_VALUE;
+        for (int y = snap.roofY; y >= snap.minY; y--) {
+            BlockState state = snap.stateAt(y);
+            if (!isTallStructureCollapseMaterial(state)) {
+                continue;
+            }
+            shellBlocks++;
+            highest = Math.max(highest, y);
+            lowest = Math.min(lowest, y);
+        }
+        if (shellBlocks < 5) {
+            return false;
+        }
+
+        int span = highest - lowest + 1;
+        double collapsePsi = structureShockPsi(snap.psi, snap.radial);
+        boolean severeZone = snap.radial <= this.geometry.shockSevereRadius();
+        return span >= 10 && (collapsePsi >= 5.0D || severeZone && collapsePsi >= 2.4D);
+    }
+
+    private void appendTallColumnAnnihilationEdits(StructureColumnSnapshot snap, List<BlockEdit> edits, boolean treeOnly) {
+        int maxEdits = maxStructureEdits(snap.psi);
+        for (int y = snap.roofY; y >= snap.minY && edits.size() < maxEdits; y--) {
+            BlockState state = snap.stateAt(y);
+            if (state.isAir() || state.is(Blocks.BEDROCK) || state.hasBlockEntity() || state.is(BlockTags.FIRE)
+                    || state.is(Blocks.WATER)) {
+                continue;
+            }
+
+            boolean remove = treeOnly
+                    ? isTreeMaterial(state) || isTreeAttachedFragileMaterial(state)
+                    : isTallStructureCollapseMaterial(state);
+            if (remove) {
+                edits.add(new BlockEdit(BlockPos.asLong(snap.x, y, snap.z), null, true));
+            }
+        }
     }
 
     private void appendTreeDamageEdits(StructureColumnSnapshot snap, List<BlockEdit> edits) {
@@ -1904,6 +1979,19 @@ public final class ActiveNuclearBlast {
         return state.is(BlockTags.LEAVES) || state.is(Blocks.VINE);
     }
 
+    private static boolean isTreeAttachedFragileMaterial(BlockState state) {
+        return BlastMaterialRules.isFragileVegetation(state) || state.is(Blocks.MOSS_BLOCK)
+                || state.is(Blocks.MOSS_CARPET) || state.is(Blocks.HANGING_ROOTS);
+    }
+
+    private static boolean isTallStructureCollapseMaterial(BlockState state) {
+        return BlastMaterialRules.isVegetationOrLightStructure(state)
+                || BlastMaterialRules.isRoofLike(state)
+                || BlastMaterialRules.isMasonryStructure(state)
+                || state.is(Blocks.GLASS) || state.is(Blocks.GLASS_PANE) || state.is(Blocks.TINTED_GLASS)
+                || state.getBlock() instanceof net.minecraft.world.level.block.StainedGlassPaneBlock;
+    }
+
     private static boolean isStructuralTarget(BlockState state, int y, int roofY, int openSides, boolean openAbove) {
         if (BlastMaterialRules.isRoofLike(state) || BlastMaterialRules.isVegetationOrLightStructure(state)
                 || state.is(Blocks.GLASS) || state.is(Blocks.GLASS_PANE)) {
@@ -1924,7 +2012,11 @@ public final class ActiveNuclearBlast {
         }
         int openSides = 0;
         for (Direction direction : HORIZONTAL) {
-            if (level.getBlockState(pos.relative(direction)).isAir()) {
+            BlockPos neighbor = pos.relative(direction);
+            if (!level.hasChunk(neighbor.getX() >> 4, neighbor.getZ() >> 4)) {
+                continue;
+            }
+            if (level.getBlockState(neighbor).isAir()) {
                 openSides++;
             }
         }
@@ -2045,18 +2137,21 @@ public final class ActiveNuclearBlast {
 
     private int structureScanDepth(double psi) {
         if (psi >= 15.0D) {
-            return 56;
+            return 192;
         }
         if (psi >= 8.0D) {
-            return 42;
+            return 176;
         }
         if (psi >= 4.0D) {
-            return 32;
+            return 152;
         }
         if (psi >= 2.0D) {
-            return 22;
+            return 128;
         }
-        return 16;
+        if (psi >= 0.75D) {
+            return 96;
+        }
+        return 64;
     }
 
     private int structureScanMinY(ServerLevel level, int x, int z, int terrainY, int roofY, double psi) {
@@ -2064,7 +2159,7 @@ public final class ActiveNuclearBlast {
         if (roofY > terrainY + 2) {
             BlockState roofState = level.getBlockState(new BlockPos(x, roofY, z));
             if (isTreeMaterial(roofState)) {
-                depth = Math.max(depth, Math.min(96, roofY - terrainY + 4));
+                depth = Math.max(depth, Math.min(192, roofY - terrainY + 64));
             }
         }
         return Math.max(level.getMinY() + 1, roofY - depth);
@@ -2183,18 +2278,18 @@ public final class ActiveNuclearBlast {
 
     private int maxStructureEdits(double psi) {
         if (psi >= 15.0D) {
-            return 128;
+            return 320;
         }
         if (psi >= 8.0D) {
-            return 104;
+            return 280;
         }
         if (psi >= 4.0D) {
-            return 78;
+            return 220;
         }
         if (psi >= 2.0D) {
-            return 52;
+            return 160;
         }
-        return 32;
+        return 96;
     }
 
     private void damageEntities(ServerLevel level) {
