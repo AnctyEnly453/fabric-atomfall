@@ -37,7 +37,7 @@ public final class AtomfallOverlay {
         int height = guiGraphics.guiHeight();
 
         if (frameCounter++ % 2 == 0) {
-            AABB searchBox = minecraft.player.getBoundingBox().inflate(300.0D);
+            AABB searchBox = minecraft.player.getBoundingBox().inflate(4096.0D);
             cachedClouds = minecraft.level.getEntitiesOfClass(NuclearCloudEntity.class, searchBox);
             cachedShockwaves = minecraft.level.getEntitiesOfClass(ShockwaveRingEntity.class, searchBox);
             cachedThermalRings = minecraft.level.getEntitiesOfClass(ThermalPulseRingEntity.class, searchBox);
@@ -103,11 +103,16 @@ public final class AtomfallOverlay {
             double distance = horizontalDistance(minecraft, ring.getX(), ring.getZ());
             float diff = Math.abs((float) distance - ring.getRenderRadius(partialTick));
             float width = Math.max(14.0F, ring.getCoreRadius() * 0.12F);
+            float linger = 1.0F - Mth.clamp((ring.tickCount + partialTick) / 160.0F, 0.0F, 1.0F);
             if (diff > width) {
+                if (distance < ring.getRenderRadius(partialTick)) {
+                    float inside = 1.0F - Mth.clamp((float) distance / Math.max(1.0F, ring.getRenderRadius(partialTick)), 0.0F, 1.0F);
+                    strongest = Math.max(strongest, inside * linger * 0.26F);
+                }
                 continue;
             }
             float proximity = 1.0F - diff / width;
-            strongest = Math.max(strongest, proximity * 0.55F);
+            strongest = Math.max(strongest, proximity * 0.70F + linger * 0.12F);
         }
         return strongest;
     }

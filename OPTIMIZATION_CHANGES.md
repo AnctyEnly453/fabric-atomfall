@@ -56,6 +56,11 @@
 - Vegetation, leaves, logs, and wood framing use stronger structural damage multipliers and lower effective failure thresholds.
 - Structure snapshots now capture horizontal open-side counts and above-air exposure so async damage can peel exterior walls, roofs, glass, and weak masonry more consistently.
 
+### 10.10 Thermal expression pass
+- Temperature zones now keep a hot-zone plateau in addition to the peak Gaussian flash, so core heat persists visually instead of collapsing immediately.
+- Environmental heat processing now advances through chunk/ring bands with deterministic jitter and local footprints, producing broader scorch, burn, glassing, and steam patches than full-radius random samples.
+- The thermal overlay searches the full large-blast visual range and keeps a short inside-the-pulse heat tint after the ring passes the player.
+
 ## 1. 掉落物洪峰修复
 
 - 新增 `BlastWorldMutations.java`：统一使用 `Block.UPDATE_CLIENTS | Block.UPDATE_SUPPRESS_DROPS` 进行无掉落方块更新

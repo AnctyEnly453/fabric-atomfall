@@ -24,6 +24,9 @@ import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.CollisionContext;
 
 public final class TemperatureZone {
+    private static final double MIN_ENVIRONMENT_RING_WIDTH = 16.0D;
+    private static final int THERMAL_FOOTPRINT_MAX_RADIUS = 4;
+
     private final BlockPos center;
     private final double coreRadius;
     private final double maxRadius;
@@ -34,6 +37,23 @@ public final class TemperatureZone {
 
     private int ageTicks;
     private double currentRadius;
+    private double environmentSampleRadius;
+    private double environmentRingStart;
+    private double environmentRingEnd;
+    private int environmentChunkStartZ;
+    private int environmentChunkEndX;
+    private int environmentChunkEndZ;
+    private int environmentChunkCursorX;
+    private int environmentChunkCursorZ;
+    private boolean environmentRingActive;
+
+    private static final class EnvironmentStats {
+        int budget;
+
+        EnvironmentStats(int budget) {
+            this.budget = budget;
+        }
+    }
 
     public static final Codec<TemperatureZone> CODEC = RecordCodecBuilder.create(instance ->
             instance.group(
@@ -93,70 +113,217 @@ public final class TemperatureZone {
         if (distance > this.currentRadius) {
             return TemperatureMaterialRules.AMBIENT_C;
         }
-        double cooling = Math.exp(-this.ageTicks / (double) this.lifeTicks * 2.1D);
+        double ageProgress = Mth.clamp(this.ageTicks / (double) this.lifeTicks, 0.0D, 1.0D);
+        double cooling = 0.18D + 0.82D * Math.exp(-ageProgress * 2.1D);
         double sigma = Math.max(1.0D, this.currentRadius * 0.42D);
         double gaussian = Math.exp(-(distance * distance) / (2.0D * sigma * sigma));
-        double base = TemperatureMaterialRules.AMBIENT_C + (this.peakTemperatureC - TemperatureMaterialRules.AMBIENT_C) * gaussian * cooling;
+        double flash = TemperatureMaterialRules.AMBIENT_C + (this.peakTemperatureC - TemperatureMaterialRules.AMBIENT_C) * gaussian * cooling;
+        double hotRadius = Math.max(this.coreRadius, this.currentRadius * 0.46D);
+        double hotFalloff = distance <= this.coreRadius
+                ? 1.0D
+                : 1.0D - smoothstep((distance - this.coreRadius) / Math.max(1.0D, hotRadius - this.coreRadius));
+        double hot = TemperatureMaterialRules.AMBIENT_C
+                + (this.hotZoneTemperatureC - TemperatureMaterialRules.AMBIENT_C) * hotFalloff * (0.42D + cooling * 0.58D);
+        double base = Math.max(flash, hot);
         double shield = shielding(level, position);
         return TemperatureMaterialRules.AMBIENT_C + (base - TemperatureMaterialRules.AMBIENT_C) * shield;
     }
 
     private void processEnvironment(ServerLevel level) {
-        int attempts = Math.min(BlastPhysicsConstants.thermalBlockBudget(), 40 + Mth.floor((float) (this.currentRadius * 0.35D)));
-        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
-        BlockPos.MutableBlockPos overlayPos = new BlockPos.MutableBlockPos();
+        EnvironmentStats stats = new EnvironmentStats(Math.max(1, BlastPhysicsConstants.thermalBlockBudget()));
+        while (stats.budget > 0) {
+            if (!this.environmentRingActive && !startEnvironmentRing()) {
+                break;
+            }
+            int budgetBefore = stats.budget;
+            processEnvironmentRing(level, stats);
+            if (stats.budget == budgetBefore && !this.environmentRingActive) {
+                break;
+            }
+        }
+    }
 
-        for (int i = 0; i < attempts; i++) {
-            double angle = level.random.nextDouble() * Math.PI * 2.0D;
-            double radius = Math.sqrt(level.random.nextDouble()) * this.currentRadius;
-            int x = Mth.floor(this.center.getX() + Math.cos(angle) * radius);
-            int z = Mth.floor(this.center.getZ() + Math.sin(angle) * radius);
-            if (!level.hasChunk(x >> 4, z >> 4)) {
+    private boolean startEnvironmentRing() {
+        if (this.currentRadius <= 1.0D) {
+            return false;
+        }
+        if (this.environmentSampleRadius >= this.currentRadius - 1.0D) {
+            this.environmentSampleRadius = 0.0D;
+        }
+
+        this.environmentRingStart = Math.max(0.0D, this.environmentSampleRadius);
+        int step = thermalColumnStep(this.environmentRingStart);
+        double ringWidth = Math.max(MIN_ENVIRONMENT_RING_WIDTH, step * 5.0D);
+        this.environmentRingEnd = Math.min(this.currentRadius, this.environmentRingStart + ringWidth);
+        if (this.environmentRingEnd <= this.environmentRingStart + 0.25D) {
+            return false;
+        }
+
+        int pad = 16 + step;
+        this.environmentChunkCursorX = Mth.floor((this.center.getX() - this.environmentRingEnd - pad) / 16.0D);
+        this.environmentChunkEndX = Mth.floor((this.center.getX() + this.environmentRingEnd + pad) / 16.0D);
+        this.environmentChunkStartZ = Mth.floor((this.center.getZ() - this.environmentRingEnd - pad) / 16.0D);
+        this.environmentChunkEndZ = Mth.floor((this.center.getZ() + this.environmentRingEnd + pad) / 16.0D);
+        this.environmentChunkCursorZ = this.environmentChunkStartZ;
+        this.environmentRingActive = true;
+        return true;
+    }
+
+    private void processEnvironmentRing(ServerLevel level, EnvironmentStats stats) {
+        while (stats.budget > 0 && this.environmentChunkCursorX <= this.environmentChunkEndX) {
+            int chunkX = this.environmentChunkCursorX;
+            int chunkZ = this.environmentChunkCursorZ;
+            this.environmentChunkCursorZ++;
+            if (this.environmentChunkCursorZ > this.environmentChunkEndZ) {
+                this.environmentChunkCursorZ = this.environmentChunkStartZ;
+                this.environmentChunkCursorX++;
+            }
+
+            if (!chunkIntersectsEnvironmentRing(chunkX, chunkZ)) {
                 continue;
             }
-            int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z) - 1;
-            pos.set(x, y, z);
-
-            double absoluteTemperature = sampleAbsoluteTemperature(level, Vec3.atCenterOf(pos));
-            if (absoluteTemperature <= TemperatureMaterialRules.AMBIENT_C + 10.0D) {
+            if (!level.hasChunk(chunkX, chunkZ)) {
                 continue;
             }
+            processEnvironmentChunk(level, stats, chunkX, chunkZ);
+        }
 
-            applySurfaceHeat(level, pos, absoluteTemperature);
-            for (int dy = 1; dy <= 8; dy++) {
-                overlayPos.set(x, y + dy, z);
-                BlockState overlay = level.getBlockState(overlayPos);
-                if (overlay.isAir()) {
+        if (this.environmentChunkCursorX > this.environmentChunkEndX) {
+            this.environmentSampleRadius = this.environmentRingEnd;
+            this.environmentRingActive = false;
+        }
+    }
+
+    private boolean chunkIntersectsEnvironmentRing(int chunkX, int chunkZ) {
+        int minX = chunkX << 4;
+        int minZ = chunkZ << 4;
+        int maxX = minX + 15;
+        int maxZ = minZ + 15;
+        double closestDx = closestDistance1D(this.center.getX(), minX, maxX);
+        double closestDz = closestDistance1D(this.center.getZ(), minZ, maxZ);
+        double closestSq = closestDx * closestDx + closestDz * closestDz;
+        double outer = this.environmentRingEnd + 8.0D;
+        if (closestSq > outer * outer) {
+            return false;
+        }
+        if (this.environmentRingStart <= 1.0D) {
+            return true;
+        }
+        double farthestDx = farthestDistance1D(this.center.getX(), minX, maxX);
+        double farthestDz = farthestDistance1D(this.center.getZ(), minZ, maxZ);
+        double inner = Math.max(0.0D, this.environmentRingStart - 8.0D);
+        return farthestDx * farthestDx + farthestDz * farthestDz >= inner * inner;
+    }
+
+    private void processEnvironmentChunk(ServerLevel level, EnvironmentStats stats, int chunkX, int chunkZ) {
+        int step = thermalColumnStep((this.environmentRingStart + this.environmentRingEnd) * 0.5D);
+        int minX = chunkX << 4;
+        int minZ = chunkZ << 4;
+        int maxX = minX + 15;
+        int maxZ = minZ + 15;
+        int phaseX = environmentGridPhase(chunkX, chunkZ, step, 113);
+        int phaseZ = environmentGridPhase(chunkX, chunkZ, step, 197);
+        int startX = alignToGrid(minX, step, this.center.getX() + phaseX);
+        int startZ = alignToGrid(minZ, step, this.center.getZ() + phaseZ);
+
+        for (int x = startX; x <= maxX && stats.budget > 0; x += step) {
+            for (int z = startZ; z <= maxZ && stats.budget > 0; z += step) {
+                int sampleX = jitterEnvironmentSample(x, z, step, minX, maxX, 271);
+                int sampleZ = jitterEnvironmentSample(z, x, step, minZ, maxZ, 337);
+                double dx = sampleX + 0.5D - this.center.getX();
+                double dz = sampleZ + 0.5D - this.center.getZ();
+                double distance = Math.sqrt(dx * dx + dz * dz);
+                if (distance < this.environmentRingStart || distance > this.environmentRingEnd) {
                     continue;
                 }
-                if (TemperatureMaterialRules.isLitterOrDebris(overlay)
-                        || TemperatureMaterialRules.isSnow(overlay)
-                        || TemperatureMaterialRules.isIce(overlay)
-                        || TemperatureMaterialRules.isFlammable(overlay)) {
-                    applySurfaceHeat(level, overlayPos, absoluteTemperature);
+                stats.budget--;
+                applyThermalFootprint(level, sampleX, sampleZ, distance);
+            }
+        }
+    }
+
+    private void applyThermalFootprint(ServerLevel level, int x, int z, double distance) {
+        int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z) - 1;
+        BlockPos origin = new BlockPos(x, y, z);
+        double absoluteTemperature = sampleAbsoluteTemperature(level, Vec3.atCenterOf(origin));
+        if (absoluteTemperature <= TemperatureMaterialRules.AMBIENT_C + 10.0D) {
+            return;
+        }
+
+        int brush = thermalFootprintRadius(absoluteTemperature, distance);
+        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+        BlockPos.MutableBlockPos overlayPos = new BlockPos.MutableBlockPos();
+        for (int ox = -brush; ox <= brush; ox++) {
+            for (int oz = -brush; oz <= brush; oz++) {
+                double offsetDistance = Math.sqrt(ox * (double) ox + oz * (double) oz);
+                if (offsetDistance > brush + 0.35D) {
+                    continue;
                 }
-                if (overlay.is(net.minecraft.tags.BlockTags.LOGS)) {
-                    for (int canopyY = y + dy + 1; canopyY <= y + dy + 6 && canopyY < level.getMaxY(); canopyY++) {
-                        overlayPos.set(x, canopyY, z);
-                        BlockState canopy = level.getBlockState(overlayPos);
-                        if (canopy.isAir()) {
-                            continue;
-                        }
-                        if (canopy.is(net.minecraft.tags.BlockTags.LEAVES) || canopy.is(net.minecraft.tags.BlockTags.LOGS)) {
-                            applySurfaceHeat(level, overlayPos, absoluteTemperature);
-                        } else {
-                            break;
-                        }
+                int nx = x + ox;
+                int nz = z + oz;
+                if (!level.hasChunk(nx >> 4, nz >> 4)) {
+                    continue;
+                }
+                double noise = environmentNoise(nx, nz, 421);
+                double falloff = 1.0D - Mth.clamp(offsetDistance / Math.max(1.0D, brush + 0.35D), 0.0D, 1.0D);
+                double localTemperature = absoluteTemperature * Mth.clamp(0.72D + falloff * 0.24D + noise * 0.10D, 0.68D, 1.08D);
+                int ny = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, nx, nz) - 1;
+                applyHeatColumn(level, pos, overlayPos, nx, ny, nz, localTemperature, distance + offsetDistance);
+            }
+        }
+    }
+
+    private void applyHeatColumn(ServerLevel level, BlockPos.MutableBlockPos pos, BlockPos.MutableBlockPos overlayPos,
+                                 int x, int y, int z, double absoluteTemperature, double distance) {
+        pos.set(x, y, z);
+        applySurfaceHeat(level, pos, absoluteTemperature);
+        for (int dy = 1; dy <= 10; dy++) {
+            overlayPos.set(x, y + dy, z);
+            BlockState overlay = level.getBlockState(overlayPos);
+            if (overlay.isAir()) {
+                continue;
+            }
+            if (TemperatureMaterialRules.isLitterOrDebris(overlay)
+                    || TemperatureMaterialRules.isSnow(overlay)
+                    || TemperatureMaterialRules.isIce(overlay)
+                    || TemperatureMaterialRules.isFlammable(overlay)) {
+                applySurfaceHeat(level, overlayPos, absoluteTemperature);
+            }
+            if (overlay.is(net.minecraft.tags.BlockTags.LOGS)) {
+                for (int canopyY = y + dy + 1; canopyY <= y + dy + 7 && canopyY < level.getMaxY(); canopyY++) {
+                    overlayPos.set(x, canopyY, z);
+                    BlockState canopy = level.getBlockState(overlayPos);
+                    if (canopy.isAir()) {
+                        continue;
+                    }
+                    if (canopy.is(net.minecraft.tags.BlockTags.LEAVES) || canopy.is(net.minecraft.tags.BlockTags.LOGS)) {
+                        applySurfaceHeat(level, overlayPos, absoluteTemperature);
+                    } else {
+                        break;
                     }
                 }
             }
-            if (radius <= this.waterFlashRadius && level.random.nextFloat() < 0.75F) {
-                BlockPos waterSeed = WaterEvaporationUtil.findWaterSeed(level, x, z, 20);
-                if (waterSeed != null) {
-                    flashBoilWater(level, waterSeed, absoluteTemperature);
-                }
+        }
+        if (distance <= this.waterFlashRadius && environmentNoise(x, z, 557) > 0.18D) {
+            BlockPos waterSeed = WaterEvaporationUtil.findWaterSeed(level, x, z, 20);
+            if (waterSeed != null) {
+                flashBoilWater(level, waterSeed, absoluteTemperature);
             }
         }
+    }
+
+    private int thermalFootprintRadius(double absoluteTemperature, double distance) {
+        int radius = 1;
+        if (absoluteTemperature >= TemperatureMaterialRules.SOIL_SCORCH_POINT_C) {
+            radius = 2;
+        }
+        if (absoluteTemperature >= TemperatureMaterialRules.WOOD_IGNITION_POINT_C) {
+            radius = 3;
+        }
+        if (absoluteTemperature >= TemperatureMaterialRules.GLASS_SOFTENING_POINT_C || distance <= this.coreRadius) {
+            radius = 4;
+        }
+        return Math.min(radius, THERMAL_FOOTPRINT_MAX_RADIUS);
     }
 
     private void applySurfaceHeat(ServerLevel level, BlockPos.MutableBlockPos pos, double absoluteTemperature) {
@@ -311,6 +478,78 @@ public final class TemperatureZone {
                 level.sendParticles(ParticleTypes.SMOKE, x, y + 0.08D, z, 1, 0.03D, 0.03D, 0.03D, 0.0D);
             }
         }
+    }
+
+    private int thermalColumnStep(double radius) {
+        if (radius <= this.coreRadius) {
+            return 3;
+        }
+        if (radius <= this.currentRadius * 0.45D) {
+            return 5;
+        }
+        if (radius <= this.currentRadius * 0.75D) {
+            return 7;
+        }
+        return 9;
+    }
+
+    private static int environmentGridPhase(int chunkX, int chunkZ, int step, int salt) {
+        if (step <= 1) {
+            return 0;
+        }
+        long hash = ((long) chunkX * 341873128712L) ^ ((long) chunkZ * 132897987541L) ^ salt;
+        hash ^= hash >>> 33;
+        hash *= 0xff51afd7ed558ccdL;
+        hash ^= hash >>> 33;
+        return Math.floorMod((int) (hash ^ (hash >>> 32)), step);
+    }
+
+    private static int alignToGrid(int min, int step, int origin) {
+        if (step <= 1) {
+            return min;
+        }
+        int offset = Math.floorMod(min - origin, step);
+        return offset == 0 ? min : min + (step - offset);
+    }
+
+    private static int jitterEnvironmentSample(int value, int other, int step, int min, int max, int salt) {
+        if (step <= 2) {
+            return Mth.clamp(value, min, max);
+        }
+        int span = Math.max(1, step / 2);
+        long hash = BlockPos.asLong(value, salt, other);
+        hash ^= hash >>> 33;
+        hash *= 0xff51afd7ed558ccdL;
+        hash ^= hash >>> 33;
+        int jitter = Math.floorMod((int) (hash ^ (hash >>> 32)), span * 2 + 1) - span;
+        return Mth.clamp(value + jitter, min, max);
+    }
+
+    private static double environmentNoise(int x, int z, int salt) {
+        long hash = BlockPos.asLong(x, salt, z);
+        hash ^= hash >>> 33;
+        hash *= 0xff51afd7ed558ccdL;
+        hash ^= hash >>> 33;
+        return Math.floorMod((int) (hash ^ (hash >>> 32)), 10000) / 9999.0D;
+    }
+
+    private static double closestDistance1D(double point, int min, int max) {
+        if (point < min) {
+            return min - point;
+        }
+        if (point > max) {
+            return point - max;
+        }
+        return 0.0D;
+    }
+
+    private static double farthestDistance1D(double point, int min, int max) {
+        return Math.max(Math.abs(point - min), Math.abs(point - max));
+    }
+
+    private static double smoothstep(double value) {
+        double t = Mth.clamp(value, 0.0D, 1.0D);
+        return t * t * (3.0D - 2.0D * t);
     }
 
     private double shielding(ServerLevel level, Vec3 position) {

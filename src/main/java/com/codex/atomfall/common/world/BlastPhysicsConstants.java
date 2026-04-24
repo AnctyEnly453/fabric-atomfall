@@ -16,9 +16,9 @@ public final class BlastPhysicsConstants {
 
     public enum PerformanceProfile {
 
-        HIGH_FIDELITY("high_fidelity", 96, 4, 7, 10, 2, 1, 1, 1400, 1600, 128, false),
-        BALANCED("balanced", 48, 5, 9, 12, 1, 1, 0, 1100, 1200, 80, false),
-        PERFORMANCE("performance", 36, 5, 9, 14, 1, 1, 0, 900, 1000, 64, false);
+        HIGH_FIDELITY("high_fidelity", 96, 4, 7, 10, 2, 1, 1, 2200, 3200, 128, false),
+        BALANCED("balanced", 64, 4, 8, 11, 1, 1, 0, 1800, 2400, 96, false),
+        PERFORMANCE("performance", 48, 5, 8, 12, 1, 1, 0, 1400, 1800, 80, false);
         private final String id;
         private final int shockSectors;
         private final int shockStrideNear;
@@ -94,8 +94,8 @@ public final class BlastPhysicsConstants {
         }
     }
 
-    private static volatile PerformanceProfile activeProfile = PerformanceProfile.PERFORMANCE;
-    private static volatile ThermalProfile activeThermalProfile = ThermalProfile.PERFORMANCE;
+    private static volatile PerformanceProfile activeProfile = PerformanceProfile.BALANCED;
+    private static volatile ThermalProfile activeThermalProfile = ThermalProfile.BALANCED;
 
     private static volatile int ovShockSectors = -1;
     private static volatile int ovStrideNear = -1;

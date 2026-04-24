@@ -20,8 +20,8 @@ public final class BlastMaterialRules {
         if (state.isAir()) {
             return Double.POSITIVE_INFINITY;
         }
-        if (state.is(BlockTags.LEAVES) || state.is(Blocks.SHORT_GRASS) || state.is(Blocks.TALL_GRASS)) {
-            return 0.15D;
+        if (isLeafLike(state) || isFragileVegetation(state)) {
+            return 0.10D;
         }
         if (state.is(BlockTags.IMPERMEABLE) || state.is(Blocks.GLASS_PANE) || state.is(Blocks.TINTED_GLASS)
                 || state.getBlock() instanceof net.minecraft.world.level.block.StainedGlassPaneBlock) {
@@ -91,13 +91,14 @@ public final class BlastMaterialRules {
     public static boolean isFlammable(BlockState state) {
         return state.is(BlockTags.LEAVES) || state.is(BlockTags.LOGS) || state.is(BlockTags.PLANKS)
                 || state.is(BlockTags.WOOL) || state.is(Blocks.HAY_BLOCK) || state.is(Blocks.BOOKSHELF)
-                || state.is(Blocks.SHORT_GRASS) || state.is(Blocks.TALL_GRASS) || state.is(Blocks.DANDELION)
-                || state.is(Blocks.POPPY);
+                || isFragileVegetation(state);
     }
 
     public static boolean isLeafLike(BlockState state) {
         return state.is(BlockTags.LEAVES) || state.is(Blocks.SHORT_GRASS) || state.is(Blocks.TALL_GRASS)
-                || state.is(Blocks.FERN) || state.is(Blocks.LARGE_FERN) || state.is(Blocks.VINE);
+                || state.is(Blocks.FERN) || state.is(Blocks.LARGE_FERN) || state.is(Blocks.VINE)
+                || state.is(Blocks.DEAD_BUSH) || state.is(Blocks.BROWN_MUSHROOM) || state.is(Blocks.RED_MUSHROOM)
+                || state.getBlock() instanceof net.minecraft.world.level.block.BushBlock;
     }
 
     public static boolean isWoodFraming(BlockState state) {
@@ -107,9 +108,18 @@ public final class BlastMaterialRules {
     }
 
     public static boolean isVegetationOrLightStructure(BlockState state) {
-        return state.is(BlockTags.LEAVES) || state.is(BlockTags.LOGS) || state.is(BlockTags.PLANKS)
+        return isLeafLike(state) || state.is(BlockTags.LOGS) || state.is(BlockTags.PLANKS)
                 || state.is(BlockTags.WOOL) || state.is(Blocks.HAY_BLOCK) || state.is(Blocks.BOOKSHELF)
                 || state.is(BlockTags.DOORS) || state.is(BlockTags.FENCES) || state.is(BlockTags.TRAPDOORS);
+    }
+
+    public static boolean isFragileVegetation(BlockState state) {
+        return state.is(Blocks.SHORT_GRASS) || state.is(Blocks.TALL_GRASS)
+                || state.is(Blocks.FERN) || state.is(Blocks.LARGE_FERN)
+                || state.is(Blocks.VINE) || state.is(Blocks.DEAD_BUSH)
+                || state.is(Blocks.BROWN_MUSHROOM) || state.is(Blocks.RED_MUSHROOM)
+                || state.is(Blocks.DANDELION) || state.is(Blocks.POPPY)
+                || state.getBlock() instanceof net.minecraft.world.level.block.BushBlock;
     }
 
     public static boolean isMasonryStructure(BlockState state) {

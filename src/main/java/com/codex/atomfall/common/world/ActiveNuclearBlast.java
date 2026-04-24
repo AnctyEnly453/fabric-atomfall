@@ -62,6 +62,11 @@ public final class ActiveNuclearBlast {
     private static final int BLAST_BLOCK_UPDATE_FLAGS = BlastWorldMutations.NO_DROP_FLAGS;
     private static final int PARALLEL_MIN_SNAPSHOTS = 120;
     private static final int CRATER_COLLAPSE_MAX_PASSES = 8;
+    private static final double MIN_SURFACE_SHOCK_PSI = 0.22D;
+    private static final double MIN_STRUCTURE_SHOCK_PSI = 0.42D;
+    private static final int MAX_STRUCTURAL_SNAPS_PER_TICK = 120;
+    private static final int MAX_SHOCK_APPLY_PER_TICK = 2400;
+    private static final int MAX_WATER_BOILS_PER_TICK = 3;
     private static final ExecutorService COMPUTE_EXECUTOR = createComputeExecutor();
 
     private final BlockPos origin;
@@ -219,7 +224,7 @@ public final class ActiveNuclearBlast {
                 return false;
             }
             BlockState current = level.getBlockState(mutable);
-            if (current.isAir() || current.is(Blocks.BEDROCK) || current.hasBlockEntity()) {
+            if (current.is(Blocks.BEDROCK) || current.hasBlockEntity()) {
                 return false;
             }
             if (this.remove) {
@@ -228,17 +233,25 @@ public final class ActiveNuclearBlast {
                 }
                 level.setBlock(mutable, Blocks.AIR.defaultBlockState(), BLAST_BLOCK_UPDATE_FLAGS);
                 return true;
-            } else {
-                if (current == this.newState) {
+            }
+
+            if (this.newState == null || this.newState.isAir() || current == this.newState) {
+                return false;
+            }
+            if (current.isAir()) {
+                mutable.move(Direction.DOWN);
+                BlockState below = level.getBlockState(mutable);
+                mutable.move(Direction.UP);
+                if (below.isAir() || below.is(Blocks.BEDROCK) || below.hasBlockEntity()) {
                     return false;
                 }
-                level.setBlock(mutable, this.newState, BLAST_BLOCK_UPDATE_FLAGS);
-                return true;
             }
+            level.setBlock(mutable, this.newState, BLAST_BLOCK_UPDATE_FLAGS);
+            return true;
         }
     }
 
-    private record CraterColumnSnapshot(int x, int z, int topY, int floorY, BlockState floorState) {
+    private record CraterColumnSnapshot(int x, int z, int terrainY, int topY, int floorY, BlockState floorState) {
     }
     private int craterCursorX;
     private int craterCursorZ;
@@ -421,7 +434,7 @@ public final class ActiveNuclearBlast {
         }
     }
 
-    private record StructureColumnSnapshot(int x, int z, int radial, double psi, double angle, int roofY, int minY,
+    private record StructureColumnSnapshot(int x, int z, int radial, double psi, double angle, int terrainY, int roofY, int minY,
                                            BlockState[] states, double[] exposures, byte[] openSides, boolean[] openAbove) {
         BlockState stateAt(int y) {
             int idx = this.roofY - y;
@@ -834,7 +847,7 @@ public final class ActiveNuclearBlast {
                 double normalized = Math.sqrt(distanceSq) / Math.max(1.0D, this.geometry.craterRadius());
                 int floorY = craterFloorY(level, worldX, worldZ, terrainY, normalized);
                 BlockState floorState = level.getBlockState(new BlockPos(worldX, floorY, worldZ));
-                snapshots.add(new CraterColumnSnapshot(worldX, worldZ, topY, floorY, floorState));
+                snapshots.add(new CraterColumnSnapshot(worldX, worldZ, terrainY, topY, floorY, floorState));
             }
         }
 
@@ -1013,9 +1026,13 @@ public final class ActiveNuclearBlast {
         List<SurfaceColumnSnapshot> surfaceSnaps = new ArrayList<>();
         List<StructureColumnSnapshot> structSnaps = new ArrayList<>();
         BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
+        int structSnapCount = 0;
+        List<ShockTarget> batchTargets = new ArrayList<>(targets.size());
 
         for (ShockTarget t : targets) {
-            if (t.needsSurface) {
+            boolean needsSurface = t.needsSurface;
+            boolean needsStructural = t.needsStructural;
+            if (needsSurface) {
                 int surfaceY = this.initialSurface.getOrCapture(level, t.x, t.z);
                 int floorY = Math.max(level.getMinY() + 4, surfaceY - shockScourDepth(t.psi, t.radial, t.x, t.z));
                 int startY = surfaceY + 1;
@@ -1033,33 +1050,41 @@ public final class ActiveNuclearBlast {
                 }
                 surfaceSnaps.add(new SurfaceColumnSnapshot(t.x, t.z, t.radial, t.psi, surfaceY, floorY, states, thresholds));
             }
-            if (t.needsStructural) {
-                int roofY = level.getHeight(Heightmap.Types.WORLD_SURFACE, t.x, t.z) - 1;
-                int minY = Math.max(level.getMinY() + 1, roofY - structureScanDepth(t.psi));
-                if (roofY >= minY) {
-                    int len = roofY - minY + 1;
-                    BlockState[] states = new BlockState[len];
-                    double[] exposures = new double[len];
-                    byte[] openSides = new byte[len];
-                    boolean[] openAbove = new boolean[len];
-                    double dirX = Math.cos(t.angle);
-                    double dirZ = Math.sin(t.angle);
-                    for (int y = roofY, i = 0; y >= minY; y--, i++) {
-                        m.set(t.x, y, t.z);
-                        states[i] = level.getBlockState(m);
-                        openSides[i] = (byte) openSideCount(level, m);
-                        openAbove[i] = level.isEmptyBlock(m.above());
-                        exposures[i] = exposureFactor(level, m, states[i], dirX, dirZ, roofY, openSides[i], openAbove[i]);
+            if (needsStructural) {
+                if (structSnapCount < MAX_STRUCTURAL_SNAPS_PER_TICK) {
+                    int terrainY = this.initialSurface.getOrCapture(level, t.x, t.z);
+                    int roofY = level.getHeight(Heightmap.Types.WORLD_SURFACE, t.x, t.z) - 1;
+                    int minY = structureScanMinY(level, t.x, t.z, terrainY, roofY, t.psi);
+                    if (roofY >= minY) {
+                        int len = roofY - minY + 1;
+                        BlockState[] states = new BlockState[len];
+                        double[] exposures = new double[len];
+                        byte[] openSides = new byte[len];
+                        boolean[] openAbove = new boolean[len];
+                        double dirX = Math.cos(t.angle);
+                        double dirZ = Math.sin(t.angle);
+                        for (int y = roofY, i = 0; y >= minY; y--, i++) {
+                            m.set(t.x, y, t.z);
+                            states[i] = level.getBlockState(m);
+                            openSides[i] = (byte) openSideCount(level, m);
+                            openAbove[i] = level.isEmptyBlock(m.above());
+                            exposures[i] = exposureFactor(level, m, states[i], dirX, dirZ, roofY, openSides[i], openAbove[i]);
+                        }
+                        structSnaps.add(new StructureColumnSnapshot(t.x, t.z, t.radial, t.psi, t.angle, terrainY, roofY, minY,
+                                states, exposures, openSides, openAbove));
                     }
-                    structSnaps.add(new StructureColumnSnapshot(t.x, t.z, t.radial, t.psi, t.angle, roofY, minY,
-                            states, exposures, openSides, openAbove));
+                    structSnapCount++;
+                } else {
+                    queueDeferredEdit(new PendingEdit(t.x, t.z, t.radial, t.psi, t.angle, true), false);
+                    needsStructural = false;
                 }
             }
+            batchTargets.add(new ShockTarget(t.x, t.z, t.radial, t.psi, t.angle, needsSurface, needsStructural, t.sideEffects));
         }
 
         this.pendingShockBatches.add(new PendingShockBatch(
                 submitShockEdits(surfaceSnaps, structSnaps),
-                new ArrayList<>(targets)
+                batchTargets
         ));
     }
 
@@ -1236,7 +1261,7 @@ public final class ActiveNuclearBlast {
         }
 
         double psi = this.geometry.peakOverpressurePsi(distance) * this.sectorEnergy[sector];
-        if (psi < 0.25D) {
+        if (psi < MIN_SURFACE_SHOCK_PSI) {
             return;
         }
 
@@ -1316,8 +1341,9 @@ public final class ActiveNuclearBlast {
                 double offsetDistance = Math.sqrt(ox * (double) ox + oz * (double) oz);
                 double falloff = 1.0D - Mth.clamp(offsetDistance / (radius + 1.15D), 0.0D, 1.0D);
                 double offsetPsi = psi * Mth.clamp(0.62D + falloff * 0.25D + edgeNoise * 0.13D, 0.54D, 0.94D);
-                boolean includeStructural = shouldStructureBrushSample(psi, radial, ox, oz, radius, edgeNoise);
-                int brushCost = queueShockTarget(targets, nx, nz, radial, offsetPsi, angle, includeStructural, false);
+                boolean includeStructural = shouldStructureBrushSample(offsetPsi, radial, ox, oz, radius, edgeNoise);
+                boolean includeSideEffects = offsetDistance <= Math.max(1.0D, radius * 0.45D) && offsetPsi >= 0.9D;
+                int brushCost = queueShockTarget(targets, nx, nz, radial, offsetPsi, angle, includeStructural, includeSideEffects);
                 if (brushCost > 0) {
                     stats.queuedTargets += brushCost;
                     stats.budget -= brushCost;
@@ -1327,7 +1353,7 @@ public final class ActiveNuclearBlast {
     }
 
     private boolean shouldStructureBrushSample(double psi, int radial, int ox, int oz, int radius, double noise) {
-        if (psi < 0.65D || radius <= 0) {
+        if (psi < MIN_STRUCTURE_SHOCK_PSI || radius <= 0) {
             return false;
         }
         int stride = structureBrushStride(psi, radial);
@@ -1343,13 +1369,13 @@ public final class ActiveNuclearBlast {
     }
 
     private int structureBrushStride(double psi, int radial) {
-        if (radial <= this.geometry.shockCoreRadius() || psi >= 8.0D) {
+        if (radial <= this.geometry.shockCoreRadius() || psi >= 6.0D) {
+            return 1;
+        }
+        if (radial <= this.geometry.shockSevereRadius() || psi >= 2.0D) {
             return 2;
         }
-        if (radial <= this.geometry.shockSevereRadius() || psi >= 3.0D) {
-            return 3;
-        }
-        return 4;
+        return 3;
     }
 
     private int queueShockTarget(List<ShockTarget> targets, int x, int z, int radial, double psi, double angle,
@@ -1358,8 +1384,8 @@ public final class ActiveNuclearBlast {
         long structKey = BlockPos.asLong(x, 1, z);
         double prevSurfacePsi = this.processedSurfaceColumns.getOrDefault(surfKey, -1.0D);
         double prevStructPsi = this.processedStructureColumns.getOrDefault(structKey, -1.0D);
-        boolean needsSurface = psi > prevSurfacePsi + 1.5D;
-        boolean needsStructural = includeStructural && psi > prevStructPsi + 1.5D;
+        boolean needsSurface = shouldRetouchColumn(psi, prevSurfacePsi, MIN_SURFACE_SHOCK_PSI, surfaceRetouchPsiStep(psi, radial));
+        boolean needsStructural = includeStructural && shouldRetouchColumn(psi, prevStructPsi, MIN_STRUCTURE_SHOCK_PSI, structureRetouchPsiStep(psi, radial));
         if (!needsSurface && !needsStructural) {
             return 0;
         }
@@ -1372,6 +1398,33 @@ public final class ActiveNuclearBlast {
         }
         targets.add(new ShockTarget(x, z, radial, psi, angle, needsSurface, needsStructural, sideEffects));
         return (needsSurface ? 1 : 0) + (needsStructural ? 1 : 0);
+    }
+
+    private static boolean shouldRetouchColumn(double psi, double previousPsi, double minimumPsi, double stepPsi) {
+        if (psi < minimumPsi) {
+            return false;
+        }
+        return previousPsi < 0.0D || psi > previousPsi + stepPsi;
+    }
+
+    private double surfaceRetouchPsiStep(double psi, int radial) {
+        if (radial <= this.geometry.shockCoreRadius() || psi >= 8.0D) {
+            return 0.35D;
+        }
+        if (radial <= this.geometry.shockSevereRadius() || psi >= 2.0D) {
+            return 0.55D;
+        }
+        return 0.90D;
+    }
+
+    private double structureRetouchPsiStep(double psi, int radial) {
+        if (radial <= this.geometry.shockCoreRadius() || psi >= 6.0D) {
+            return 0.25D;
+        }
+        if (radial <= this.geometry.shockSevereRadius() || psi >= 1.6D) {
+            return 0.42D;
+        }
+        return 0.70D;
     }
 
     private void applyShockEdits(ServerLevel level) {
@@ -1513,55 +1566,39 @@ public final class ActiveNuclearBlast {
     private int processStructureColumn(ServerLevel level, int x, int z, double angle, int radial, double psi) {
         long key = BlockPos.asLong(x, 1, z);
         double prevPsi = this.processedStructureColumns.getOrDefault(key, -1.0D);
-        if (psi <= prevPsi + 1.5D) {
+        if (!shouldRetouchColumn(psi, prevPsi, MIN_STRUCTURE_SHOCK_PSI, structureRetouchPsiStep(psi, radial))) {
             return 0;
         }
         this.processedStructureColumns.put(key, psi);
 
+        int terrainY = this.initialSurface.getOrCapture(level, x, z);
         int roofY = level.getHeight(Heightmap.Types.WORLD_SURFACE, x, z) - 1;
-        int edits = 0;
-        int minY = Math.max(level.getMinY() + 1, roofY - structureScanDepth(psi));
+        int minY = structureScanMinY(level, x, z, terrainY, roofY, psi);
+        if (roofY < minY) {
+            return 0;
+        }
+        int len = roofY - minY + 1;
+        BlockState[] states = new BlockState[len];
+        double[] exposures = new double[len];
+        byte[] openSides = new byte[len];
+        boolean[] openAbove = new boolean[len];
         BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
         double dirX = Math.cos(angle);
         double dirZ = Math.sin(angle);
-
-        for (int y = roofY; y >= minY; y--) {
+        for (int y = roofY, i = 0; y >= minY; y--, i++) {
             pos.set(x, y, z);
-            BlockState state = level.getBlockState(pos);
-            if (state.isAir() || state.hasBlockEntity()) {
-                continue;
-            }
+            states[i] = level.getBlockState(pos);
+            openSides[i] = (byte) openSideCount(level, pos);
+            openAbove[i] = level.isEmptyBlock(pos.above());
+            exposures[i] = exposureFactor(level, pos, states[i], dirX, dirZ, roofY, openSides[i], openAbove[i]);
+        }
 
-            int openSides = openSideCount(level, pos);
-            boolean openAbove = level.isEmptyBlock(pos.above());
-            if (!isStructuralTarget(state, y, roofY, openSides, openAbove)) {
-                continue;
-            }
-
-            double requiredPsi = structureRequiredPsi(state, openSides, openAbove);
-            double exposure = exposureFactor(level, pos, state, dirX, dirZ, roofY, openSides, openAbove);
-            double effectivePsi = structureEffectivePsi(psi, radial, state, exposure, openSides, openAbove);
-            if (effectivePsi < requiredPsi) {
-                continue;
-            }
-
-            if (state.is(BlockTags.FIRE) || state.is(Blocks.WATER)) {
-                continue;
-            }
-
-            if (state.getFluidState().is(FluidTags.WATER)) {
-                level.setBlock(pos, Blocks.AIR.defaultBlockState(), BLAST_BLOCK_UPDATE_FLAGS);
-            } else {
-                level.setBlock(pos, Blocks.AIR.defaultBlockState(), BLAST_BLOCK_UPDATE_FLAGS);
-            }
-            edits++;
-
-            if (state.is(Blocks.GLASS) || state.is(Blocks.GLASS_PANE)) {
-                level.sendParticles(new BlockParticleOption(ParticleTypes.BLOCK, state), x + 0.5D, y + 0.5D, z + 0.5D, 8, 0.22D, 0.22D, 0.22D, 0.04D);
-            }
-
-            if (edits >= maxStructureEdits(psi)) {
-                break;
+        StructureColumnSnapshot snap = new StructureColumnSnapshot(x, z, radial, psi, angle, terrainY, roofY, minY,
+                states, exposures, openSides, openAbove);
+        int edits = 0;
+        for (BlockEdit edit : computeStructureEdits(snap)) {
+            if (edit.apply(level, pos)) {
+                edits++;
             }
         }
 
@@ -2055,6 +2092,9 @@ public final class ActiveNuclearBlast {
     }
 
     private void damageEntities(ServerLevel level) {
+        if (this.ageTicks % 2 != 0) {
+            return;
+        }
         double min = this.previousAverageFront - shellWidth(this.previousAverageFront);
         double max = this.averageFront + shellWidth(this.averageFront);
         AABB bounds = new AABB(
@@ -2206,6 +2246,7 @@ public final class ActiveNuclearBlast {
         }
         int budget = BlastPhysicsConstants.shockBlockBudget();
         int startBudget = budget;
+        int waterBoilsRemaining = MAX_WATER_BOILS_PER_TICK;
         java.util.Iterator<List<ShockTarget>> batchIterator = this.readyShockTargets.iterator();
         while (batchIterator.hasNext() && budget > 0) {
             List<ShockTarget> targets = batchIterator.next();
@@ -2221,11 +2262,12 @@ public final class ActiveNuclearBlast {
                 }
                 int surfaceY = this.initialSurface.getOrCapture(level, target.x, target.z);
                 BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos(target.x, surfaceY, target.z);
-                if (target.psi >= 3.0D && level.getBlockState(pos).getFluidState().is(FluidTags.WATER)) {
+                if (target.psi >= 3.0D && waterBoilsRemaining > 0 && level.getBlockState(pos).getFluidState().is(FluidTags.WATER)) {
                     BlockPos waterSeed = WaterEvaporationUtil.findWaterSeed(level, target.x, target.z, 24);
                     if (waterSeed != null) {
                         flashBoilWater(level, waterSeed, target.psi);
                         budget -= 4;
+                        waterBoilsRemaining--;
                     }
                 }
                 if (target.radial <= this.geometry.scorchRadius() && target.psi >= 0.6D) {
@@ -2576,15 +2618,15 @@ public final class ActiveNuclearBlast {
         int baseBudget = BlastPhysicsConstants.shockBlockBudget();
         int queued = this.shockEditQueue.size();
         if (queued > 250_000) {
-            return baseBudget * 4;
+            return Math.min(baseBudget * 4, MAX_SHOCK_APPLY_PER_TICK);
         }
         if (queued > 100_000) {
-            return baseBudget * 3;
+            return Math.min(baseBudget * 3, MAX_SHOCK_APPLY_PER_TICK);
         }
         if (queued > 25_000) {
-            return baseBudget * 2;
+            return Math.min(baseBudget * 2, MAX_SHOCK_APPLY_PER_TICK);
         }
-        return baseBudget;
+        return Math.min(baseBudget, MAX_SHOCK_APPLY_PER_TICK);
     }
 
     private int craterMutationBudget() {
