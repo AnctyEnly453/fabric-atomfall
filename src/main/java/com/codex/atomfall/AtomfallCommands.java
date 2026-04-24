@@ -35,6 +35,15 @@ public final class AtomfallCommands {
                                                         .executes(AtomfallCommands::setShockParam))))
                                 .then(literal("reset")
                                         .executes(AtomfallCommands::resetShockOverrides))
+                                .then(literal("log")
+                                        .executes(AtomfallCommands::showShockLog)
+                                        .then(literal("on")
+                                                .executes(AtomfallCommands::enableShockLog))
+                                        .then(literal("off")
+                                                .executes(AtomfallCommands::disableShockLog))
+                                        .then(literal("interval")
+                                                .then(argument("ticks", IntegerArgumentType.integer(1, 1200))
+                                                        .executes(AtomfallCommands::setShockLogInterval))))
                                 .then(argument("profile", StringArgumentType.word())
                                         .suggests(AtomfallCommands::suggestProfiles)
                                         .executes(AtomfallCommands::setPerformance)))
@@ -69,6 +78,8 @@ public final class AtomfallCommands {
                         + " | sectors=" + BlastPhysicsConstants.shockSectors()
                         + " | craterBudget=" + BlastPhysicsConstants.craterBlockBudget()
                         + " | shockBudget=" + BlastPhysicsConstants.shockBlockBudget()
+                        + " | shockLog=" + (BlastPhysicsConstants.shockPerfLogEnabled() ? "on" : "off")
+                        + "/" + BlastPhysicsConstants.shockPerfLogIntervalTicks() + "t"
                         + " | thermal=" + thermal.id()
                         + " | thermalBudget=" + BlastPhysicsConstants.thermalBlockBudget()
                         + " | waterBudget=" + BlastPhysicsConstants.waterBfsBudget()
@@ -90,6 +101,47 @@ public final class AtomfallCommands {
         context.getSource().sendSuccess(
                 () -> Component.literal("Atomfall performance set to " + profile.id()
                         + ". New blasts use the new sector count immediately; active blasts finish with mixed settings."),
+                true
+        );
+        return 1;
+    }
+
+    private static int showShockLog(CommandContext<CommandSourceStack> context) {
+        context.getSource().sendSuccess(
+                () -> Component.literal("Atomfall shock perf log: "
+                        + (BlastPhysicsConstants.shockPerfLogEnabled() ? "on" : "off")
+                        + " | interval=" + BlastPhysicsConstants.shockPerfLogIntervalTicks()
+                        + " ticks | use /atomfall performance log on, off, or interval <ticks>"),
+                false
+        );
+        return 1;
+    }
+
+    private static int enableShockLog(CommandContext<CommandSourceStack> context) {
+        BlastPhysicsConstants.setShockPerfLogEnabled(true);
+        context.getSource().sendSuccess(
+                () -> Component.literal("Atomfall shock perf log enabled. Active blasts will write Atomfall shock perf lines every "
+                        + BlastPhysicsConstants.shockPerfLogIntervalTicks() + " ticks."),
+                true
+        );
+        return 1;
+    }
+
+    private static int disableShockLog(CommandContext<CommandSourceStack> context) {
+        BlastPhysicsConstants.setShockPerfLogEnabled(false);
+        context.getSource().sendSuccess(
+                () -> Component.literal("Atomfall shock perf log disabled."),
+                true
+        );
+        return 1;
+    }
+
+    private static int setShockLogInterval(CommandContext<CommandSourceStack> context) {
+        int ticks = IntegerArgumentType.getInteger(context, "ticks");
+        BlastPhysicsConstants.setShockPerfLogIntervalTicks(ticks);
+        context.getSource().sendSuccess(
+                () -> Component.literal("Atomfall shock perf log interval set to "
+                        + BlastPhysicsConstants.shockPerfLogIntervalTicks() + " ticks."),
                 true
         );
         return 1;

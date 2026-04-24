@@ -57,6 +57,7 @@ public final class ActiveNuclearBlast {
     private static final Direction[] HORIZONTAL = {Direction.NORTH, Direction.SOUTH, Direction.WEST, Direction.EAST};
     private static final int UPDATE_CLIENTS_ONLY = 2;
     private static final int PARALLEL_MIN_SNAPSHOTS = 120;
+    private static final int CRATER_COLLAPSE_MAX_PASSES = 8;
     private static final ExecutorService COMPUTE_EXECUTOR = createComputeExecutor();
 
     private final BlockPos origin;
@@ -65,6 +66,7 @@ public final class ActiveNuclearBlast {
     private final SurfaceHeightCache initialSurface;
     private final float[] sectorFront;
     private final float[] previousSectorFront;
+    private final float[] sectorSampleFront;
     private final float[] sectorEnergy;
     private final it.unimi.dsi.fastutil.longs.Long2DoubleOpenHashMap processedSurfaceColumns = new it.unimi.dsi.fastutil.longs.Long2DoubleOpenHashMap();
     private final it.unimi.dsi.fastutil.longs.Long2DoubleOpenHashMap processedStructureColumns = new it.unimi.dsi.fastutil.longs.Long2DoubleOpenHashMap();
@@ -75,6 +77,29 @@ public final class ActiveNuclearBlast {
     private boolean flashApplied;
     private boolean craterFinished;
     private boolean craterCollapsed;
+    private boolean craterCollapseStarted;
+    private boolean craterCollapseColumnReady;
+    private boolean craterCollapsePassChanged;
+    private int craterCollapsePass;
+    private int craterCollapseX;
+    private int craterCollapseZ;
+    private int craterCollapseY;
+    private int craterCollapseFloorY;
+    private int craterCollapseTopY;
+    private boolean shockChunkRingActive;
+    private boolean shockChunkZRangeReady;
+    private boolean shockChunkColumnReady;
+    private int shockChunkRingStart;
+    private int shockChunkRingEnd;
+    private int shockChunkMinX;
+    private int shockChunkMaxX;
+    private int shockChunkCursorX;
+    private int shockChunkCursorZ;
+    private int shockChunkRangeIndex;
+    private int shockChunkRangeEndZ;
+    private int shockChunkBlockX;
+    private int shockChunkBlockZ;
+    private int shockChunkBlockStartZ;
     private CompletableFuture<List<BlockEdit>> craterComputeFuture;
     private final ArrayList<PendingShockBatch> pendingShockBatches = new ArrayList<>();
     private final ArrayList<List<ShockTarget>> readyShockTargets = new ArrayList<>();
@@ -93,6 +118,26 @@ public final class ActiveNuclearBlast {
     }
 
     private record PendingShockBatch(CompletableFuture<List<BlockEdit>> editsFuture, List<ShockTarget> targets) {
+    }
+
+    private static final class ShockSamplingStats {
+        int budget;
+        int scansRemaining;
+        int sampledColumns;
+        int chunksVisited;
+        int chunksSkipped;
+        int queuedTargets;
+        int deferredTargets;
+        int completedRings;
+
+        ShockSamplingStats(int budget) {
+            this.budget = budget;
+            this.scansRemaining = budget * 64;
+        }
+
+        boolean canContinue() {
+            return this.budget > 0 && this.scansRemaining > 0;
+        }
     }
 
     private record BlockEdit(long packedPos, BlockState newState, boolean remove) {
@@ -118,7 +163,7 @@ public final class ActiveNuclearBlast {
         }
     }
 
-    private record CraterColumnSnapshot(int x, int z, int initialY, int floorY, int fireballRoof, BlockState floorState) {
+    private record CraterColumnSnapshot(int x, int z, int topY, int floorY, BlockState floorState) {
     }
     private int craterCursorX;
     private int craterCursorZ;
@@ -201,6 +246,7 @@ public final class ActiveNuclearBlast {
                         Codec.BOOL.fieldOf("crater_finished").forGetter(PersistenceState::craterFinished),
                         Codec.BOOL.fieldOf("crater_needs_rebuild").forGetter(PersistenceState::craterNeedsRebuild),
                         Codec.FLOAT.listOf().fieldOf("sector_front").forGetter(PersistenceState::sectorFront),
+                        Codec.FLOAT.listOf().optionalFieldOf("sector_sample_front", List.of()).forGetter(PersistenceState::sectorSampleFront),
                         Codec.FLOAT.listOf().fieldOf("sector_energy").forGetter(PersistenceState::sectorEnergy),
                         Codec.DOUBLE.fieldOf("average_front").forGetter(PersistenceState::averageFront),
                         SurfaceState.CODEC.fieldOf("surface_state").forGetter(PersistenceState::surfaceState),
@@ -215,13 +261,14 @@ public final class ActiveNuclearBlast {
         private final boolean craterFinished;
         private final boolean craterNeedsRebuild;
         private final List<Float> sectorFront;
+        private final List<Float> sectorSampleFront;
         private final List<Float> sectorEnergy;
         private final double averageFront;
         private final SurfaceState surfaceState;
         private final WorkState workState;
 
         private PersistenceState(BlockPos origin, double yieldKt, int ageTicks, boolean flashApplied, boolean craterFinished,
-                                 boolean craterNeedsRebuild, List<Float> sectorFront, List<Float> sectorEnergy, double averageFront,
+                                 boolean craterNeedsRebuild, List<Float> sectorFront, List<Float> sectorSampleFront, List<Float> sectorEnergy, double averageFront,
                                  SurfaceState surfaceState, WorkState workState) {
             this.origin = origin;
             this.yieldKt = yieldKt;
@@ -230,6 +277,7 @@ public final class ActiveNuclearBlast {
             this.craterFinished = craterFinished;
             this.craterNeedsRebuild = craterNeedsRebuild;
             this.sectorFront = sectorFront;
+            this.sectorSampleFront = sectorSampleFront;
             this.sectorEnergy = sectorEnergy;
             this.averageFront = averageFront;
             this.surfaceState = surfaceState;
@@ -262,6 +310,10 @@ public final class ActiveNuclearBlast {
 
         private List<Float> sectorFront() {
             return this.sectorFront;
+        }
+
+        private List<Float> sectorSampleFront() {
+            return this.sectorSampleFront;
         }
 
         private List<Float> sectorEnergy() {
@@ -307,23 +359,26 @@ public final class ActiveNuclearBlast {
         this(origin, center, geometry, new SurfaceHeightCache(),
                 new float[BlastPhysicsConstants.shockSectors()],
                 new float[BlastPhysicsConstants.shockSectors()],
+                new float[BlastPhysicsConstants.shockSectors()],
                 new float[BlastPhysicsConstants.shockSectors()]);
         for (int i = 0; i < this.sectorFront.length; i++) {
             this.sectorFront[i] = (float) geometry.fireballRadius();
             this.previousSectorFront[i] = (float) geometry.fireballRadius();
+            this.sectorSampleFront[i] = (float) geometry.fireballRadius();
             this.sectorEnergy[i] = 1.0F;
         }
     }
 
     private ActiveNuclearBlast(BlockPos origin, Vec3 center, NuclearBlast.BlastGeometry geometry,
                                SurfaceHeightCache initialSurface, float[] sectorFront,
-                               float[] previousSectorFront, float[] sectorEnergy) {
+                               float[] previousSectorFront, float[] sectorSampleFront, float[] sectorEnergy) {
         this.origin = origin;
         this.center = center;
         this.geometry = geometry;
         this.initialSurface = initialSurface;
         this.sectorFront = sectorFront;
         this.previousSectorFront = previousSectorFront;
+        this.sectorSampleFront = sectorSampleFront;
         this.sectorEnergy = sectorEnergy;
         this.averageFront = geometry.fireballRadius();
         this.previousAverageFront = this.averageFront;
@@ -341,6 +396,7 @@ public final class ActiveNuclearBlast {
                 this.craterFinished,
                 !this.craterFinished && (!this.craterEditsPrepared || this.craterComputeFuture != null),
                 toFloatList(this.sectorFront),
+                toFloatList(this.sectorSampleFront),
                 toFloatList(this.sectorEnergy),
                 this.averageFront,
                 new SurfaceState(
@@ -369,6 +425,7 @@ public final class ActiveNuclearBlast {
                 new SurfaceHeightCache(),
                 new float[sectorCount],
                 new float[sectorCount],
+                new float[sectorCount],
                 new float[sectorCount]
         );
 
@@ -381,6 +438,10 @@ public final class ActiveNuclearBlast {
         blast.initialSurface.restoreEntries(state.surfaceState().surfaceHeights());
         copyFloats(state.sectorFront(), blast.sectorFront, (float) geometry.fireballRadius());
         System.arraycopy(blast.sectorFront, 0, blast.previousSectorFront, 0, blast.sectorFront.length);
+        copyFloats(state.sectorSampleFront(), blast.sectorSampleFront, (float) geometry.fireballRadius());
+        if (state.sectorSampleFront().isEmpty()) {
+            System.arraycopy(blast.sectorFront, 0, blast.sectorSampleFront, 0, blast.sectorFront.length);
+        }
         copyFloats(state.sectorEnergy(), blast.sectorEnergy, 1.0F);
 
         for (ColumnPsiEntry entry : state.surfaceState().processedSurfaceColumns()) {
@@ -414,12 +475,12 @@ public final class ActiveNuclearBlast {
             applyInitialFlash(level);
         }
 
+        int craterRadius = Mth.ceil(this.geometry.craterRadius());
         if (!this.craterFinished) {
             processCrater(level);
-            if (this.craterFinished && !this.craterCollapsed) {
-                collapseCraterFloatingBlocks(level, Mth.ceil(this.geometry.craterRadius()));
-                this.craterCollapsed = true;
-            }
+        }
+        if (this.craterFinished && !this.craterCollapsed) {
+            processCraterCollapse(level, craterRadius);
         }
 
         advanceShockwave(level);
@@ -430,7 +491,9 @@ public final class ActiveNuclearBlast {
         emitShellParticles(level);
         processDeferredEdits(level);
 
-        if (this.craterFinished && allSectorsMaxed() && this.ageTicks > 20 && this.deferredEdits.isEmpty()) {
+        if (this.craterFinished && this.craterCollapsed && allSectorsMaxed() && allShockSectorsSampled()
+                && this.ageTicks > 20 && this.deferredEdits.isEmpty() && this.pendingShockBatches.isEmpty()
+                && this.readyShockTargets.isEmpty() && this.shockEditQueue.isEmpty()) {
             return true;
         }
         int maxTicks = Mth.ceil(this.geometry.shockSurfaceRadius() / BlastPhysicsConstants.SOUND_SPEED_BLOCKS_PER_TICK) + 800;
@@ -549,12 +612,106 @@ public final class ActiveNuclearBlast {
         }
     }
 
-    private void prepareCraterEditsAsync(ServerLevel level, int craterRadius) {
-        int maxFloor = Math.max(level.getMinY() + 6, this.origin.getY() - Mth.ceil(this.geometry.craterDepth()) - 4);
+    private void processCraterCollapse(ServerLevel level, int craterRadius) {
+        if (this.craterCollapsed) {
+            return;
+        }
+        if (!this.craterCollapseStarted) {
+            startCraterCollapsePass(craterRadius);
+        }
 
+        int budget = Math.max(256, BlastPhysicsConstants.craterBlockBudget());
+        int maxScans = budget * 10;
+        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+        while (budget > 0 && maxScans > 0 && !this.craterCollapsed) {
+            if (this.craterCollapseX > craterRadius) {
+                if (this.craterCollapsePassChanged && this.craterCollapsePass + 1 < CRATER_COLLAPSE_MAX_PASSES) {
+                    this.craterCollapsePass++;
+                    startCraterCollapsePass(craterRadius);
+                    continue;
+                }
+                this.craterCollapsed = true;
+                break;
+            }
+            if (!prepareCraterCollapseColumn(level)) {
+                advanceCraterCollapseColumn(craterRadius);
+                maxScans--;
+                continue;
+            }
+            if (this.craterCollapseY > this.craterCollapseTopY) {
+                advanceCraterCollapseColumn(craterRadius);
+                maxScans--;
+                continue;
+            }
+
+            int worldX = this.origin.getX() + this.craterCollapseX;
+            int worldZ = this.origin.getZ() + this.craterCollapseZ;
+            pos.set(worldX, this.craterCollapseY, worldZ);
+            BlockState state = level.getBlockState(pos);
+            maxScans--;
+            if (!state.isAir() && !state.is(Blocks.BEDROCK) && !state.hasBlockEntity()) {
+                BlockState below = level.getBlockState(pos.set(worldX, this.craterCollapseY - 1, worldZ));
+                if (below.isAir()) {
+                    level.setBlock(pos.set(worldX, this.craterCollapseY, worldZ), Blocks.AIR.defaultBlockState(), UPDATE_CLIENTS_ONLY);
+                    budget--;
+                    this.craterCollapsePassChanged = true;
+                }
+            }
+            this.craterCollapseY++;
+        }
+    }
+
+    private void startCraterCollapsePass(int craterRadius) {
+        this.craterCollapseStarted = true;
+        this.craterCollapsePassChanged = false;
+        this.craterCollapseColumnReady = false;
+        this.craterCollapseX = -craterRadius;
+        this.craterCollapseZ = -craterRadius;
+        this.craterCollapseY = 0;
+    }
+
+    private boolean prepareCraterCollapseColumn(ServerLevel level) {
+        if (this.craterCollapseColumnReady) {
+            return true;
+        }
+        double distanceSq = this.craterCollapseX * (double) this.craterCollapseX + this.craterCollapseZ * (double) this.craterCollapseZ;
+        if (distanceSq > this.geometry.craterRadius() * this.geometry.craterRadius()) {
+            return false;
+        }
+
+        int worldX = this.origin.getX() + this.craterCollapseX;
+        int worldZ = this.origin.getZ() + this.craterCollapseZ;
+        if (!level.hasChunk(worldX >> 4, worldZ >> 4)) {
+            return false;
+        }
+
+        int terrainY = this.initialSurface.getOrCapture(level, worldX, worldZ);
+        double normalized = Math.sqrt(distanceSq) / Math.max(1.0D, this.geometry.craterRadius());
+        this.craterCollapseFloorY = craterFloorY(level, worldX, worldZ, terrainY, normalized);
+        this.craterCollapseTopY = Math.max(terrainY, level.getHeight(Heightmap.Types.WORLD_SURFACE, worldX, worldZ) - 1);
+        this.craterCollapseY = this.craterCollapseFloorY + 1;
+        this.craterCollapseColumnReady = true;
+        return this.craterCollapseY <= this.craterCollapseTopY;
+    }
+
+    private void advanceCraterCollapseColumn(int craterRadius) {
+        this.craterCollapseColumnReady = false;
+        this.craterCollapseZ++;
+        if (this.craterCollapseZ > craterRadius) {
+            this.craterCollapseZ = -craterRadius;
+            this.craterCollapseX++;
+        }
+    }
+
+    private void prepareCraterEditsAsync(ServerLevel level, int craterRadius) {
         java.util.Set<Long> preloadedChunks = new java.util.HashSet<>();
+        double craterRadiusSq = this.geometry.craterRadius() * this.geometry.craterRadius();
         for (int x = -craterRadius; x <= craterRadius; x++) {
             for (int z = -craterRadius; z <= craterRadius; z++) {
+                double distanceSq = x * (double) x + z * (double) z;
+                if (distanceSq > craterRadiusSq) {
+                    continue;
+                }
                 int worldX = this.origin.getX() + x;
                 int worldZ = this.origin.getZ() + z;
                 long chunkKey = ChunkPos.asLong(worldX >> 4, worldZ >> 4);
@@ -570,18 +727,16 @@ public final class ActiveNuclearBlast {
             int worldX = this.origin.getX() + x;
             for (int z = -craterRadius; z <= craterRadius; z++) {
                 int worldZ = this.origin.getZ() + z;
-                double distance = Math.sqrt(x * (double) x + z * (double) z);
-                if (distance > this.geometry.craterRadius()) {
+                double distanceSq = x * (double) x + z * (double) z;
+                if (distanceSq > craterRadiusSq) {
                     continue;
                 }
-                int initialY = this.initialSurface.getOrCapture(level, worldX, worldZ);
-                double normalized = distance / Math.max(1.0D, this.geometry.craterRadius());
-                double craterProfile = Math.pow(1.0D - normalized, 1.7D);
-                int columnDepth = Mth.floor(this.geometry.craterDepth() * craterProfile);
-                int floorY = Math.max(maxFloor, initialY - columnDepth);
-                int fireballRoof = Mth.floor(this.origin.getY() + this.geometry.fireballRadius() * 0.28D * craterProfile);
+                int terrainY = this.initialSurface.getOrCapture(level, worldX, worldZ);
+                int topY = Math.max(terrainY, level.getHeight(Heightmap.Types.WORLD_SURFACE, worldX, worldZ) - 1);
+                double normalized = Math.sqrt(distanceSq) / Math.max(1.0D, this.geometry.craterRadius());
+                int floorY = craterFloorY(level, worldX, worldZ, terrainY, normalized);
                 BlockState floorState = level.getBlockState(new BlockPos(worldX, floorY, worldZ));
-                snapshots.add(new CraterColumnSnapshot(worldX, worldZ, initialY, floorY, fireballRoof, floorState));
+                snapshots.add(new CraterColumnSnapshot(worldX, worldZ, topY, floorY, floorState));
             }
         }
 
@@ -607,14 +762,39 @@ public final class ActiveNuclearBlast {
                     edits.add(new BlockEdit(BlockPos.asLong(col.x, col.floorY, col.z), ModBlocks.SCORCHED_EARTH.get().defaultBlockState(), false));
                 }
             }
-            for (int y = col.floorY; y <= col.initialY; y++) {
-                edits.add(new BlockEdit(BlockPos.asLong(col.x, y, col.z), null, true));
-            }
-            for (int y = col.initialY + 1; y <= col.fireballRoof; y++) {
+            for (int y = col.floorY; y <= col.topY; y++) {
                 edits.add(new BlockEdit(BlockPos.asLong(col.x, y, col.z), null, true));
             }
         }
         return edits;
+    }
+
+    private int craterFloorY(ServerLevel level, int x, int z, int terrainY, double normalized) {
+        int minFloor = Math.max(level.getMinY() + 6, this.origin.getY() - Mth.ceil(this.geometry.craterDepth()) - 4);
+        double clamped = Mth.clamp(normalized, 0.0D, 1.0D);
+        double absoluteProfile = Math.pow(Math.max(0.0D, 1.0D - clamped * clamped), 0.72D);
+        double localProfile = Math.pow(1.0D - clamped, 1.7D);
+        int absoluteFloor = this.origin.getY() - Mth.floor(this.geometry.craterDepth() * absoluteProfile);
+        int localFloor = terrainY - Mth.floor(this.geometry.craterDepth() * localProfile);
+        int coreFloor = Math.min(absoluteFloor, localFloor);
+
+        double blend = smoothstep(Mth.clamp((clamped - 0.70D) / 0.30D, 0.0D, 1.0D));
+        int floor = Mth.floor(coreFloor + (localFloor - coreFloor) * blend);
+        return Math.max(minFloor, floor + craterFloorJitter(x, z, clamped));
+    }
+
+    private static double smoothstep(double value) {
+        return value * value * (3.0D - 2.0D * value);
+    }
+
+    private static int craterFloorJitter(int x, int z, double normalized) {
+        if (normalized < 0.55D) {
+            return 0;
+        }
+        int range = normalized < 0.82D ? 1 : 2;
+        long hash = BlockPos.asLong(x, 0, z) * 1103515245L + 12345L;
+        int roll = Math.floorMod((int) (hash ^ (hash >>> 32)), range * 2 + 1);
+        return roll - range;
     }
 
     private BlockState chooseMeltedFloor(BlockPos pos, BlockState current) {
@@ -712,59 +892,20 @@ public final class ActiveNuclearBlast {
         applyShockEdits(level);
         processReadyShockTargets(level);
 
-        int budget = BlastPhysicsConstants.shockBlockBudget();
+        ShockSamplingStats stats = new ShockSamplingStats(BlastPhysicsConstants.shockBlockBudget());
         List<ShockTarget> targets = new ArrayList<>();
 
-        for (int sector = 0; sector < this.sectorFront.length && budget > 0; sector++) {
-            float previous = this.previousSectorFront[sector];
-            float current = this.sectorFront[sector];
-            if (current <= previous + 0.25F) {
-                continue;
+        while (stats.canContinue()) {
+            if (!this.shockChunkRingActive && !startShockChunkRing()) {
+                break;
             }
-
-            double angle = sectorAngle(sector);
-            double perpX = -Math.sin(angle);
-            double perpZ = Math.cos(angle);
-            int stride = shellStride(current);
-            double lateralSpacing = Math.max(1.5D, stride * 1.5D);
-            for (int radial = Mth.floor(previous); radial <= Mth.floor(current) && budget > 0; radial += stride) {
-                double shellPsi = this.geometry.peakOverpressurePsi(radial) * this.sectorEnergy[sector];
-                if (shellPsi < 0.25D) {
-                    continue;
-                }
-
-                int lateralSamples = BlastPhysicsConstants.lateralShellSamples(current) + extraLateralSamples(shellPsi);
-                int wakeSteps = shockWakeSteps(shellPsi);
-                for (int wakeStep = 0; wakeStep <= wakeSteps && budget > 0; wakeStep++) {
-                    int sampleRadius = Math.max(0, radial - wakeStep * Math.max(1, stride));
-                    double psi = shockWakePsi(shellPsi, wakeStep);
-                    for (int lateralIndex = -lateralSamples; lateralIndex <= lateralSamples && budget > 0; lateralIndex++) {
-                        double lateralOffset = lateralIndex * lateralSpacing;
-                        int x = Mth.floor(this.center.x + Math.cos(angle) * sampleRadius + perpX * lateralOffset);
-                        int z = Mth.floor(this.center.z + Math.sin(angle) * sampleRadius + perpZ * lateralOffset);
-                        if (!level.hasChunk(x >> 4, z >> 4)) {
-                            long key = BlockPos.asLong(x, 0, z);
-                            if (this.deferredColumns.add(key)) {
-                                deferredEdits.add(new PendingEdit(x, z, sampleRadius, psi, angle, false));
-                                deferredEdits.add(new PendingEdit(x, z, sampleRadius, psi, angle, true));
-                            }
-                            continue;
-                        }
-
-                        budget -= 2;
-                        long surfKey = BlockPos.asLong(x, 0, z);
-                        long structKey = BlockPos.asLong(x, 1, z);
-                        double prevSurfacePsi = this.processedSurfaceColumns.getOrDefault(surfKey, -1.0D);
-                        double prevStructPsi = this.processedStructureColumns.getOrDefault(structKey, -1.0D);
-                        boolean needsSurface = psi > prevSurfacePsi + 1.5D;
-                        boolean needsStructural = psi > prevStructPsi + 1.5D;
-                        if (needsSurface || needsStructural) {
-                            targets.add(new ShockTarget(x, z, sampleRadius, psi, angle, needsSurface, needsStructural));
-                        }
-                    }
-                }
+            processShockChunkRing(level, targets, stats);
+            if (this.shockChunkRingActive) {
+                break;
             }
         }
+
+        logShockSampling(stats, targets.size());
 
         if (targets.isEmpty()) {
             return;
@@ -777,9 +918,9 @@ public final class ActiveNuclearBlast {
         for (ShockTarget t : targets) {
             if (t.needsSurface) {
                 int surfaceY = this.initialSurface.getOrCapture(level, t.x, t.z);
-                int floorY = Math.max(level.getMinY() + 4, surfaceY - shockScourDepth(t.psi, t.radial));
+                int floorY = Math.max(level.getMinY() + 4, surfaceY - shockScourDepth(t.psi, t.radial, t.x, t.z));
                 int startY = surfaceY + 1;
-                int endY = Math.max(level.getMinY() + 4, surfaceY - 6);
+                int endY = Math.max(level.getMinY() + 4, floorY);
                 if (endY > surfaceY) {
                     endY = surfaceY;
                 }
@@ -794,7 +935,7 @@ public final class ActiveNuclearBlast {
                 surfaceSnaps.add(new SurfaceColumnSnapshot(t.x, t.z, t.radial, t.psi, surfaceY, floorY, states, thresholds));
             }
             if (t.needsStructural) {
-                int roofY = level.getHeight(Heightmap.Types.MOTION_BLOCKING, t.x, t.z) - 1;
+                int roofY = level.getHeight(Heightmap.Types.WORLD_SURFACE, t.x, t.z) - 1;
                 int minY = Math.max(level.getMinY() + 1, roofY - structureScanDepth(t.psi));
                 if (roofY >= minY) {
                     int len = roofY - minY + 1;
@@ -816,6 +957,239 @@ public final class ActiveNuclearBlast {
                 submitShockEdits(surfaceSnaps, structSnaps),
                 new ArrayList<>(targets)
         ));
+    }
+
+    private boolean startShockChunkRing() {
+        double minSample = Double.POSITIVE_INFINITY;
+        double maxFront = 0.0D;
+        for (int i = 0; i < this.sectorFront.length; i++) {
+            if (this.sectorFront[i] > this.sectorSampleFront[i] + 0.25F) {
+                minSample = Math.min(minSample, this.sectorSampleFront[i]);
+                maxFront = Math.max(maxFront, this.sectorFront[i]);
+            }
+        }
+        if (!Double.isFinite(minSample)) {
+            return false;
+        }
+
+        this.shockChunkRingStart = Math.max(0, Mth.floor(minSample));
+        int stride = Math.max(2, shellStride(this.shockChunkRingStart));
+        this.shockChunkRingEnd = Math.min(Mth.ceil(maxFront), this.shockChunkRingStart + stride);
+        if (this.shockChunkRingEnd <= this.shockChunkRingStart) {
+            return false;
+        }
+
+        double outer = this.shockChunkRingEnd + 24.0D;
+        this.shockChunkMinX = Mth.floor((this.center.x - outer) / 16.0D);
+        this.shockChunkMaxX = Mth.floor((this.center.x + outer) / 16.0D);
+        this.shockChunkCursorX = this.shockChunkMinX;
+        this.shockChunkRangeIndex = 0;
+        this.shockChunkZRangeReady = false;
+        this.shockChunkColumnReady = false;
+        this.shockChunkRingActive = true;
+        return true;
+    }
+
+    private void processShockChunkRing(ServerLevel level, List<ShockTarget> targets, ShockSamplingStats stats) {
+        while (this.shockChunkRingActive && stats.canContinue()) {
+            if (!prepareShockChunkCursor()) {
+                finishShockChunkRing(stats);
+                continue;
+            }
+
+            int chunkX = this.shockChunkCursorX;
+            int chunkZ = this.shockChunkCursorZ;
+            if (!chunkIntersectsShockRing(chunkX, chunkZ)) {
+                stats.chunksSkipped++;
+                advanceShockChunkCursor();
+                continue;
+            }
+
+            stats.chunksVisited++;
+            if (processShockChunkColumns(level, targets, stats, chunkX, chunkZ)) {
+                advanceShockChunkCursor();
+            }
+        }
+    }
+
+    private boolean prepareShockChunkCursor() {
+        while (this.shockChunkCursorX <= this.shockChunkMaxX) {
+            if (!this.shockChunkZRangeReady && !prepareShockChunkZRange()) {
+                this.shockChunkCursorX++;
+                this.shockChunkRangeIndex = 0;
+                this.shockChunkColumnReady = false;
+                continue;
+            }
+            if (this.shockChunkCursorZ <= this.shockChunkRangeEndZ) {
+                return true;
+            }
+            this.shockChunkRangeIndex++;
+            this.shockChunkZRangeReady = false;
+            this.shockChunkColumnReady = false;
+        }
+        return false;
+    }
+
+    private boolean prepareShockChunkZRange() {
+        while (this.shockChunkRangeIndex < 2) {
+            int chunkMinX = this.shockChunkCursorX << 4;
+            int chunkMaxX = chunkMinX + 15;
+            double inner = Math.max(0.0D, this.shockChunkRingStart - 1.0D);
+            double outer = this.shockChunkRingEnd + 1.0D;
+            double closestDx = closestDistance1D(this.center.x, chunkMinX, chunkMaxX);
+            if (closestDx > outer + 24.0D) {
+                return false;
+            }
+
+            double outerZSpan = Math.sqrt(Math.max(0.0D, (outer + 24.0D) * (outer + 24.0D) - closestDx * closestDx));
+            int outerMinZ = Mth.floor((this.center.z - outerZSpan) / 16.0D);
+            int outerMaxZ = Mth.floor((this.center.z + outerZSpan) / 16.0D);
+
+            double farthestDx = farthestDistance1D(this.center.x, chunkMinX, chunkMaxX);
+            boolean hasInnerHole = inner > 32.0D && farthestDx < inner;
+            if (!hasInnerHole) {
+                if (this.shockChunkRangeIndex == 0) {
+                    this.shockChunkCursorZ = outerMinZ;
+                    this.shockChunkRangeEndZ = outerMaxZ;
+                    this.shockChunkZRangeReady = outerMinZ <= outerMaxZ;
+                    return this.shockChunkZRangeReady;
+                }
+                return false;
+            }
+
+            double innerZSpan = Math.sqrt(Math.max(0.0D, inner * inner - farthestDx * farthestDx));
+            innerZSpan = Math.max(0.0D, innerZSpan - 24.0D);
+            int holeMinZ = Mth.floor((this.center.z - innerZSpan) / 16.0D);
+            int holeMaxZ = Mth.floor((this.center.z + innerZSpan) / 16.0D);
+            int rangeStart = this.shockChunkRangeIndex == 0 ? outerMinZ : holeMaxZ + 1;
+            int rangeEnd = this.shockChunkRangeIndex == 0 ? holeMinZ - 1 : outerMaxZ;
+            if (rangeStart <= rangeEnd) {
+                this.shockChunkCursorZ = rangeStart;
+                this.shockChunkRangeEndZ = rangeEnd;
+                this.shockChunkZRangeReady = true;
+                return true;
+            }
+            this.shockChunkRangeIndex++;
+        }
+        return false;
+    }
+
+    private boolean processShockChunkColumns(ServerLevel level, List<ShockTarget> targets, ShockSamplingStats stats, int chunkX, int chunkZ) {
+        int step = shockChunkColumnStep((this.shockChunkRingStart + this.shockChunkRingEnd) * 0.5D);
+        int minX = chunkX << 4;
+        int minZ = chunkZ << 4;
+        int maxX = minX + 15;
+        int maxZ = minZ + 15;
+        if (!this.shockChunkColumnReady) {
+            this.shockChunkBlockX = alignToGrid(minX, step, this.origin.getX());
+            this.shockChunkBlockStartZ = alignToGrid(minZ, step, this.origin.getZ());
+            this.shockChunkBlockZ = this.shockChunkBlockStartZ;
+            this.shockChunkColumnReady = true;
+        }
+        if (this.shockChunkBlockX > maxX || this.shockChunkBlockStartZ > maxZ) {
+            this.shockChunkColumnReady = false;
+            return true;
+        }
+
+        boolean chunkLoaded = level.hasChunk(chunkX, chunkZ);
+        while (this.shockChunkBlockX <= maxX && stats.canContinue()) {
+            while (this.shockChunkBlockZ <= maxZ && stats.canContinue()) {
+                stats.scansRemaining--;
+                stats.sampledColumns++;
+                processShockChunkColumn(level, targets, stats, this.shockChunkBlockX, this.shockChunkBlockZ, chunkLoaded);
+                this.shockChunkBlockZ += step;
+            }
+            if (this.shockChunkBlockZ > maxZ) {
+                this.shockChunkBlockX += step;
+                this.shockChunkBlockZ = this.shockChunkBlockStartZ;
+            }
+        }
+
+        if (this.shockChunkBlockX > maxX) {
+            this.shockChunkColumnReady = false;
+            return true;
+        }
+        return false;
+    }
+
+    private void processShockChunkColumn(ServerLevel level, List<ShockTarget> targets, ShockSamplingStats stats, int x, int z, boolean chunkLoaded) {
+        double dx = x + 0.5D - this.center.x;
+        double dz = z + 0.5D - this.center.z;
+        double distance = Math.sqrt(dx * dx + dz * dz);
+        if (distance < this.shockChunkRingStart || distance > this.shockChunkRingEnd) {
+            return;
+        }
+
+        double angle = Math.atan2(dz, dx);
+        int sector = sectorForAngle(angle);
+        if (distance <= this.sectorSampleFront[sector] + 0.25D || distance > this.sectorFront[sector] + 0.25D) {
+            return;
+        }
+
+        double psi = this.geometry.peakOverpressurePsi(distance) * this.sectorEnergy[sector];
+        if (psi < 0.25D) {
+            return;
+        }
+
+        int radial = Mth.floor(distance);
+        if (!chunkLoaded) {
+            long key = BlockPos.asLong(x, 0, z);
+            if (this.deferredColumns.add(key)) {
+                deferredEdits.add(new PendingEdit(x, z, radial, psi, angle, false));
+                deferredEdits.add(new PendingEdit(x, z, radial, psi, angle, true));
+                stats.deferredTargets += 2;
+                stats.budget -= 2;
+            }
+            return;
+        }
+
+        int cost = queueShockTarget(targets, x, z, radial, psi, angle);
+        if (cost > 0) {
+            stats.queuedTargets += cost;
+            stats.budget -= cost;
+        }
+    }
+
+    private void advanceShockChunkCursor() {
+        this.shockChunkColumnReady = false;
+        this.shockChunkCursorZ++;
+        if (this.shockChunkCursorZ > this.shockChunkRangeEndZ) {
+            this.shockChunkRangeIndex++;
+            this.shockChunkZRangeReady = false;
+        }
+    }
+
+    private void finishShockChunkRing(ShockSamplingStats stats) {
+        for (int i = 0; i < this.sectorFront.length; i++) {
+            if (this.sectorFront[i] > this.shockChunkRingStart + 0.25F) {
+                this.sectorSampleFront[i] = Math.max(this.sectorSampleFront[i], Math.min(this.sectorFront[i], this.shockChunkRingEnd));
+            }
+        }
+        this.shockChunkRingActive = false;
+        this.shockChunkZRangeReady = false;
+        this.shockChunkColumnReady = false;
+        stats.completedRings++;
+    }
+
+    private int queueShockTarget(List<ShockTarget> targets, int x, int z, int radial, double psi, double angle) {
+        long surfKey = BlockPos.asLong(x, 0, z);
+        long structKey = BlockPos.asLong(x, 1, z);
+        double prevSurfacePsi = this.processedSurfaceColumns.getOrDefault(surfKey, -1.0D);
+        double prevStructPsi = this.processedStructureColumns.getOrDefault(structKey, -1.0D);
+        boolean needsSurface = psi > prevSurfacePsi + 1.5D;
+        boolean needsStructural = psi > prevStructPsi + 1.5D;
+        if (!needsSurface && !needsStructural) {
+            return 0;
+        }
+
+        if (needsSurface) {
+            this.processedSurfaceColumns.put(surfKey, psi);
+        }
+        if (needsStructural) {
+            this.processedStructureColumns.put(structKey, psi);
+        }
+        targets.add(new ShockTarget(x, z, radial, psi, angle, needsSurface, needsStructural));
+        return (needsSurface ? 1 : 0) + (needsStructural ? 1 : 0);
     }
 
     private void applyShockEdits(ServerLevel level) {
@@ -842,62 +1216,33 @@ public final class ActiveNuclearBlast {
         this.processedSurfaceColumns.put(key, psi);
 
         int initialY = this.initialSurface.getOrCapture(level, x, z);
-        int scourDepth = shockScourDepth(psi, radial);
+        int scourDepth = shockScourDepth(psi, radial, x, z);
         int floorY = Math.max(level.getMinY() + 4, initialY - scourDepth);
         BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos(x, initialY, z);
         int edits = 0;
 
         BlockState topState = level.getBlockState(pos);
         boolean topExposed = isSurfaceExposed(level, pos);
-        double reflectedSurfacePsi = surfaceShockPsi(psi, radial);
 
-        if (psi >= 1.0D) {
-            for (int y = initialY; y >= floorY; y--) {
-                pos.set(x, y, z);
-                BlockState state = level.getBlockState(pos);
-                if (state.isAir() || state.is(Blocks.BEDROCK) || state.hasBlockEntity()) {
-                    continue;
-                }
-
-                boolean exposed = y == initialY || isSurfaceExposed(level, pos);
-                double localPsi = reflectedSurfacePsi * layerShockFactor(initialY - y, exposed);
-                double threshold = BlastMaterialRules.surfaceFailurePsi(level, pos, state);
-
-                if (BlastMaterialRules.isVitrifiable(state) && radial <= this.geometry.vitrificationRadius() * 1.2D && localPsi >= threshold * 0.85D) {
-                    level.setBlock(pos, radial <= this.geometry.vitrificationRadius()
-                            ? ModBlocks.FUSED_GLASS.get().defaultBlockState()
-                            : Blocks.GLASS.defaultBlockState(), UPDATE_CLIENTS_ONLY);
-                    edits++;
-                    if (y < initialY) {
-                        break;
-                    }
-                    continue;
-                }
-
-                if (localPsi >= threshold) {
-                    if (BlastMaterialRules.isScorchable(state) && y == initialY && localPsi < threshold * 1.45D) {
-                        level.setBlock(pos, ModBlocks.SCORCHED_EARTH.get().defaultBlockState(), UPDATE_CLIENTS_ONLY);
-                    } else {
-                        level.setBlock(pos, Blocks.AIR.defaultBlockState(), UPDATE_CLIENTS_ONLY);
-                    }
-                    edits++;
-                    if (!BlastMaterialRules.isLooseSurface(state) && !BlastMaterialRules.isScorchable(state) && !isRockySurface(state)) {
-                        break;
-                    }
-                    continue;
-                }
-
-                if (exposed && localPsi >= threshold * 0.75D && isRockySurface(state)) {
-                    level.setBlock(pos, Blocks.AIR.defaultBlockState(), UPDATE_CLIENTS_ONLY);
-                    edits++;
-                    break;
-                }
-            }
+        int startY = initialY + 1;
+        int endY = Math.max(level.getMinY() + 4, floorY);
+        if (endY > initialY) {
+            endY = initialY;
+        }
+        int len = Math.max(1, startY - endY + 1);
+        BlockState[] states = new BlockState[len];
+        double[] thresholds = new double[len];
+        for (int y = startY, i = 0; y >= endY && i < len; y--, i++) {
+            pos.set(x, y, z);
+            states[i] = level.getBlockState(pos);
+            thresholds[i] = BlastMaterialRules.surfaceFailurePsi(level, pos, states[i]);
         }
 
-        if (edits == 0 && BlastMaterialRules.isScorchable(topState) && psi >= 0.8D) {
-            level.setBlock(pos, ModBlocks.SCORCHED_EARTH.get().defaultBlockState(), UPDATE_CLIENTS_ONLY);
-            edits++;
+        SurfaceColumnSnapshot snap = new SurfaceColumnSnapshot(x, z, radial, psi, initialY, floorY, states, thresholds);
+        for (BlockEdit edit : computeSurfaceEdits(snap)) {
+            if (edit.apply(level, pos)) {
+                edits++;
+            }
         }
 
         if (psi >= 3.0D && topState.getFluidState().is(FluidTags.WATER)) {
@@ -935,13 +1280,18 @@ public final class ActiveNuclearBlast {
 
             double threshold = BlastMaterialRules.surfaceFailurePsi(level, pos, neighbor);
             if (reflectedSurfacePsi >= threshold) {
-                level.setBlock(pos, Blocks.AIR.defaultBlockState(), UPDATE_CLIENTS_ONLY);
+                if ((BlastMaterialRules.isLooseSurface(neighbor) || BlastMaterialRules.isScorchable(neighbor) || isRockySurface(neighbor))
+                        && reflectedSurfacePsi < threshold * 1.85D) {
+                    level.setBlock(pos, shockScouredFloorState(neighbor, nx, ny, nz, radial, psi), UPDATE_CLIENTS_ONLY);
+                } else {
+                    level.setBlock(pos, Blocks.AIR.defaultBlockState(), UPDATE_CLIENTS_ONLY);
+                }
                 edits++;
                 continue;
             }
 
             if (BlastMaterialRules.isScorchable(neighbor) && reflectedSurfacePsi >= threshold * 0.7D) {
-                level.setBlock(pos, ModBlocks.SCORCHED_EARTH.get().defaultBlockState(), UPDATE_CLIENTS_ONLY);
+                level.setBlock(pos, shockScouredFloorState(neighbor, nx, ny, nz, radial, psi), UPDATE_CLIENTS_ONLY);
                 edits++;
                 continue;
             }
@@ -1017,19 +1367,22 @@ public final class ActiveNuclearBlast {
     private List<BlockEdit> computeSurfaceEdits(SurfaceColumnSnapshot snap) {
         List<BlockEdit> edits = new ArrayList<>();
         BlockState topState = snap.stateAt(snap.surfaceY);
-        boolean topExposed = snap.states[0].isAir();
         double reflectedSurfacePsi = surfaceShockPsi(snap.psi, snap.radial);
+        boolean removedAny = false;
 
-        if (snap.psi >= 1.0D) {
+        if (snap.psi >= 0.75D) {
             for (int y = snap.surfaceY; y >= snap.floorY; y--) {
                 BlockState state = snap.stateAt(y);
                 if (state.isAir() || state.is(Blocks.BEDROCK) || state.hasBlockEntity()) {
                     continue;
                 }
 
-                boolean exposed = y == snap.surfaceY || (snap.stateAt(y + 1).isAir());
+                boolean exposed = y == snap.surfaceY || removedAny || snap.stateAt(y + 1).isAir();
                 double localPsi = reflectedSurfacePsi * layerShockFactor(snap.surfaceY - y, exposed);
                 double threshold = snap.thresholdAt(y);
+                boolean surfaceLike = BlastMaterialRules.isLooseSurface(state) || BlastMaterialRules.isScorchable(state) || isRockySurface(state);
+                boolean canScour = localPsi >= threshold
+                        || (exposed && surfaceLike && localPsi >= threshold * 0.68D);
 
                 if (BlastMaterialRules.isVitrifiable(state) && snap.radial <= this.geometry.vitrificationRadius() * 1.2D && localPsi >= threshold * 0.85D) {
                     edits.add(new BlockEdit(BlockPos.asLong(snap.x, y, snap.z), snap.radial <= this.geometry.vitrificationRadius()
@@ -1041,30 +1394,154 @@ public final class ActiveNuclearBlast {
                     continue;
                 }
 
-                if (localPsi >= threshold) {
-                    if (BlastMaterialRules.isScorchable(state) && y == snap.surfaceY && localPsi < threshold * 1.45D) {
-                        edits.add(new BlockEdit(BlockPos.asLong(snap.x, y, snap.z), ModBlocks.SCORCHED_EARTH.get().defaultBlockState(), false));
-                    } else {
-                        edits.add(new BlockEdit(BlockPos.asLong(snap.x, y, snap.z), null, true));
+                if (canScour) {
+                    if (y == snap.floorY) {
+                        edits.add(new BlockEdit(BlockPos.asLong(snap.x, y, snap.z), shockScouredFloorState(state, snap.x, y, snap.z, snap.radial, snap.psi), false));
+                        break;
                     }
-                    if (!BlastMaterialRules.isLooseSurface(state) && !BlastMaterialRules.isScorchable(state) && !isRockySurface(state)) {
+                    edits.add(new BlockEdit(BlockPos.asLong(snap.x, y, snap.z), null, true));
+                    removedAny = true;
+                    if (!surfaceLike && !BlastMaterialRules.isVegetationOrLightStructure(state)) {
                         break;
                     }
                     continue;
                 }
 
-                if (exposed && localPsi >= threshold * 0.75D && isRockySurface(state)) {
-                    edits.add(new BlockEdit(BlockPos.asLong(snap.x, y, snap.z), null, true));
+                if ((removedAny || exposed) && surfaceLike && localPsi >= threshold * 0.52D) {
+                    edits.add(new BlockEdit(BlockPos.asLong(snap.x, y, snap.z), shockScouredFloorState(state, snap.x, y, snap.z, snap.radial, snap.psi), false));
                     break;
                 }
+                break;
             }
         }
 
         if (edits.isEmpty() && BlastMaterialRules.isScorchable(topState) && snap.psi >= 0.8D) {
-            edits.add(new BlockEdit(BlockPos.asLong(snap.x, snap.surfaceY, snap.z), ModBlocks.SCORCHED_EARTH.get().defaultBlockState(), false));
+            edits.add(new BlockEdit(BlockPos.asLong(snap.x, snap.surfaceY, snap.z), shockScouredFloorState(topState, snap.x, snap.surfaceY, snap.z, snap.radial, snap.psi), false));
         }
 
         return edits;
+    }
+
+    private BlockState shockScouredFloorState(BlockState current, int x, int y, int z, int radial, double psi) {
+        if (BlastMaterialRules.isVitrifiable(current) && radial <= this.geometry.vitrificationRadius() * 1.2D) {
+            return radial <= this.geometry.vitrificationRadius()
+                    ? ModBlocks.FUSED_GLASS.get().defaultBlockState()
+                    : Blocks.GLASS.defaultBlockState();
+        }
+
+        double damage = shockSurfaceDamage(x, z, radial, psi);
+        double patch = shockSurfacePattern(x, z, radial);
+        double fine = shockValueNoise(x * 0.18D, z * 0.18D, 83);
+        if (isRockySurface(current)) {
+            if (damage >= 0.78D) {
+                if (patch < 0.34D) {
+                    return Blocks.GRAVEL.defaultBlockState();
+                }
+                if (patch < 0.58D) {
+                    return Blocks.COBBLESTONE.defaultBlockState();
+                }
+                if (patch < 0.82D) {
+                    return Blocks.TUFF.defaultBlockState();
+                }
+                return fine > 0.72D ? Blocks.CALCITE.defaultBlockState() : Blocks.ANDESITE.defaultBlockState();
+            }
+            if (damage >= 0.48D) {
+                if (patch < 0.36D) {
+                    return Blocks.COBBLESTONE.defaultBlockState();
+                }
+                if (patch < 0.62D) {
+                    return Blocks.GRAVEL.defaultBlockState();
+                }
+                return current;
+            }
+            if (patch < 0.24D && psi >= 2.0D) {
+                return Blocks.GRAVEL.defaultBlockState();
+            }
+            return current;
+        }
+
+        if (BlastMaterialRules.isLooseSurface(current) || BlastMaterialRules.isScorchable(current)
+                || BlastMaterialRules.isVegetationOrLightStructure(current)) {
+            if (damage >= 0.78D) {
+                if (patch < 0.24D) {
+                    return Blocks.COBBLESTONE.defaultBlockState();
+                }
+                if (patch < 0.52D) {
+                    return Blocks.GRAVEL.defaultBlockState();
+                }
+                if (patch < 0.74D) {
+                    return Blocks.COARSE_DIRT.defaultBlockState();
+                }
+                if (patch < 0.92D) {
+                    return ModBlocks.SCORCHED_EARTH.get().defaultBlockState();
+                }
+                return Blocks.TUFF.defaultBlockState();
+            }
+            if (damage >= 0.42D) {
+                if (patch < 0.46D) {
+                    return Blocks.COARSE_DIRT.defaultBlockState();
+                }
+                if (patch < 0.68D) {
+                    return Blocks.GRAVEL.defaultBlockState();
+                }
+                if (patch < 0.88D) {
+                    return ModBlocks.SCORCHED_EARTH.get().defaultBlockState();
+                }
+                return Blocks.DIRT.defaultBlockState();
+            }
+            return patch < 0.62D ? ModBlocks.SCORCHED_EARTH.get().defaultBlockState() : Blocks.COARSE_DIRT.defaultBlockState();
+        }
+
+        if (damage >= 0.55D && patch < 0.35D) {
+            return Blocks.COBBLESTONE.defaultBlockState();
+        }
+        return current;
+    }
+
+    private double shockSurfaceDamage(int x, int z, int radial, double psi) {
+        double severe = 1.0D - Mth.clamp(radial / Math.max(1.0D, this.geometry.shockSevereRadius()), 0.0D, 1.0D);
+        double core = 1.0D - Mth.clamp(radial / Math.max(1.0D, this.geometry.shockCoreRadius()), 0.0D, 1.0D);
+        double low = shockValueNoise(x * 0.024D, z * 0.024D, 17) - 0.5D;
+        double streak = shockRadialNoise(x, z, 29) - 0.5D;
+        return Mth.clamp(psi / 13.0D + severe * 0.30D + core * 0.18D + low * 0.18D + streak * 0.22D, 0.0D, 1.0D);
+    }
+
+    private double shockSurfacePattern(int x, int z, int radial) {
+        double low = shockValueNoise(x * 0.032D, z * 0.032D, 41);
+        double streak = shockRadialNoise(x, z, 59);
+        double ring = shockValueNoise(radial * 0.045D, (x + z) * 0.012D, 73);
+        return Mth.clamp(low * 0.46D + streak * 0.42D + ring * 0.12D, 0.0D, 1.0D);
+    }
+
+    private double shockRadialNoise(int x, int z, int salt) {
+        double dx = x + 0.5D - this.center.x;
+        double dz = z + 0.5D - this.center.z;
+        double distance = Math.max(1.0D, Math.sqrt(dx * dx + dz * dz));
+        double dirX = dx / distance;
+        double dirZ = dz / distance;
+        double along = dx * dirX + dz * dirZ;
+        double across = -dx * dirZ + dz * dirX;
+        return shockValueNoise(along * 0.030D, across * 0.145D, salt);
+    }
+
+    private static double shockValueNoise(double x, double z, int salt) {
+        int x0 = Mth.floor(x);
+        int z0 = Mth.floor(z);
+        double tx = smoothstep(x - x0);
+        double tz = smoothstep(z - z0);
+        double a = shockNoiseCorner(x0, z0, salt);
+        double b = shockNoiseCorner(x0 + 1, z0, salt);
+        double c = shockNoiseCorner(x0, z0 + 1, salt);
+        double d = shockNoiseCorner(x0 + 1, z0 + 1, salt);
+        return Mth.lerp(tz, Mth.lerp(tx, a, b), Mth.lerp(tx, c, d));
+    }
+
+    private static double shockNoiseCorner(int x, int z, int salt) {
+        long hash = BlockPos.asLong(x, salt, z);
+        hash ^= hash >>> 33;
+        hash *= 0xff51afd7ed558ccdL;
+        hash ^= hash >>> 33;
+        return Math.floorMod((int) (hash ^ (hash >>> 32)), 10000) / 9999.0D;
     }
 
     private List<BlockEdit> computeStructureEdits(StructureColumnSnapshot snap) {
@@ -1200,24 +1677,52 @@ public final class ActiveNuclearBlast {
         return 12;
     }
 
-    private int shockScourDepth(double psi, int radial) {
+    private int shockScourDepth(double psi, int radial, int x, int z) {
         int depth = 0;
-        if (psi >= 16.0D) {
-            depth = 5;
+        if (psi >= 20.0D) {
+            depth = 8;
+        } else if (psi >= 16.0D) {
+            depth = 7;
         } else if (psi >= 12.0D) {
-            depth = 4;
+            depth = 6;
         } else if (psi >= 8.0D) {
-            depth = 3;
+            depth = 5;
         } else if (psi >= 4.0D) {
-            depth = 2;
+            depth = 3;
         } else if (psi >= 1.5D) {
+            depth = 2;
+        } else if (psi >= 0.8D) {
             depth = 1;
         }
 
         if (radial <= this.geometry.shockCoreRadius() * 1.1D && psi >= 5.0D) {
+            depth += 2;
+        } else if (radial <= this.geometry.shockSevereRadius() && psi >= 3.0D) {
             depth += 1;
         }
-        return Math.min(6, depth);
+
+        double damage = shockSurfaceDamage(x, z, radial, psi);
+        int ripple = Mth.floor((shockSurfacePattern(x, z, radial) - 0.5D) * 4.0D);
+        if (damage >= 0.72D) {
+            depth += 1;
+        }
+        if (psi < 2.0D) {
+            ripple = Math.min(0, ripple);
+        }
+        depth += ripple;
+        if (radial > this.geometry.shockSevereRadius()) {
+            depth = Math.min(depth, 2);
+        }
+        return Mth.clamp(depth, 0, 10);
+    }
+
+    private static int shockSurfaceHash(int x, int y, int z, int salt) {
+        long hash = BlockPos.asLong(x, y, z);
+        hash ^= salt * 0x9E3779B97F4A7C15L;
+        hash ^= hash >>> 33;
+        hash *= 0xff51afd7ed558ccdL;
+        hash ^= hash >>> 33;
+        return Math.floorMod((int) (hash ^ (hash >>> 32)), 100);
     }
 
     private boolean isRockySurface(BlockState state) {
@@ -1433,13 +1938,14 @@ public final class ActiveNuclearBlast {
             return;
         }
         int budget = BlastPhysicsConstants.shockBlockBudget();
-        outer:
-        for (List<ShockTarget> targets : this.readyShockTargets) {
-            for (ShockTarget target : targets) {
-                if (budget <= 0) {
-                    break outer;
-                }
+        java.util.Iterator<List<ShockTarget>> batchIterator = this.readyShockTargets.iterator();
+        while (batchIterator.hasNext() && budget > 0) {
+            List<ShockTarget> targets = batchIterator.next();
+            java.util.Iterator<ShockTarget> targetIterator = targets.iterator();
+            while (targetIterator.hasNext() && budget > 0) {
+                ShockTarget target = targetIterator.next();
                 if (!target.needsSurface) {
+                    targetIterator.remove();
                     continue;
                 }
                 int surfaceY = this.initialSurface.getOrCapture(level, target.x, target.z);
@@ -1458,9 +1964,12 @@ public final class ActiveNuclearBlast {
                 if (isSurfaceExposed(level, pos) && target.psi >= 1.2D) {
                     budget -= disturbSurfaceMargins(level, target.x, target.z, target.psi, target.radial);
                 }
+                targetIterator.remove();
+            }
+            if (targets.isEmpty()) {
+                batchIterator.remove();
             }
         }
-        this.readyShockTargets.clear();
     }
 
     private void processDeferredEdits(ServerLevel level) {
@@ -1493,6 +2002,51 @@ public final class ActiveNuclearBlast {
         }
     }
 
+    private boolean chunkIntersectsShockRing(int chunkX, int chunkZ) {
+        int minX = chunkX << 4;
+        int minZ = chunkZ << 4;
+        int maxX = minX + 15;
+        int maxZ = minZ + 15;
+        double inner = Math.max(0.0D, this.shockChunkRingStart - 1.0D);
+        double outer = this.shockChunkRingEnd + 1.0D;
+        double closestDx = closestDistance1D(this.center.x, minX, maxX);
+        double closestDz = closestDistance1D(this.center.z, minZ, maxZ);
+        double farthestDx = farthestDistance1D(this.center.x, minX, maxX);
+        double farthestDz = farthestDistance1D(this.center.z, minZ, maxZ);
+        double closestSq = closestDx * closestDx + closestDz * closestDz;
+        double farthestSq = farthestDx * farthestDx + farthestDz * farthestDz;
+        return closestSq <= outer * outer && farthestSq >= inner * inner;
+    }
+
+    private static double closestDistance1D(double center, int min, int max) {
+        if (center < min) {
+            return min - center;
+        }
+        if (center > max) {
+            return center - max;
+        }
+        return 0.0D;
+    }
+
+    private static double farthestDistance1D(double center, int min, int max) {
+        return Math.max(Math.abs(center - min), Math.abs(center - max));
+    }
+
+    private static int alignToGrid(int min, int step, int anchor) {
+        return min + Math.floorMod(anchor - min, step);
+    }
+
+    private int shockChunkColumnStep(double radius) {
+        int stride = shellStride(radius);
+        if (radius <= 220.0D) {
+            return Math.max(1, stride / 2);
+        }
+        if (radius <= 700.0D) {
+            return Math.max(2, stride / 3);
+        }
+        return Math.max(3, stride / 3);
+    }
+
     private int shellStride(double radius) {
         if (radius <= 180.0D) {
             return BlastPhysicsConstants.shockSampleStrideNear();
@@ -1511,9 +2065,85 @@ public final class ActiveNuclearBlast {
         return sector * (Math.PI * 2.0D / this.sectorFront.length);
     }
 
+    private int sectorForAngle(double angle) {
+        double normalized = angle < 0.0D ? angle + Math.PI * 2.0D : angle;
+        int sector = Mth.floor(normalized / (Math.PI * 2.0D) * this.sectorFront.length);
+        return Mth.clamp(sector, 0, this.sectorFront.length - 1);
+    }
+
+    private void logShockSampling(ShockSamplingStats stats, int pendingTargets) {
+        if (!BlastPhysicsConstants.shockPerfLogEnabled()) {
+            return;
+        }
+        int interval = Math.max(1, BlastPhysicsConstants.shockPerfLogIntervalTicks());
+        if (this.ageTicks % interval != 0) {
+            return;
+        }
+        if (stats.sampledColumns == 0 && stats.completedRings == 0 && pendingTargets == 0
+                && this.shockEditQueue.isEmpty() && this.pendingShockBatches.isEmpty()) {
+            return;
+        }
+
+        AtomfallMod.LOGGER.info(
+                "Atomfall shock perf age={} front={}/{} sample={}/{} ring={}..{} rings={} chunks={}/{} columns={} targets={} deferredTargets={} editQueue={} batches={} ready={} deferredEdits={} scanLeft={} budgetLeft={}",
+                this.ageTicks,
+                Mth.floor(this.previousAverageFront),
+                Mth.floor(this.averageFront),
+                Mth.floor(minShockSampleFront()),
+                Mth.floor(maxShockFront()),
+                this.shockChunkRingStart,
+                this.shockChunkRingEnd,
+                stats.completedRings,
+                stats.chunksVisited,
+                stats.chunksSkipped,
+                stats.sampledColumns,
+                pendingTargets,
+                stats.deferredTargets,
+                this.shockEditQueue.size(),
+                this.pendingShockBatches.size(),
+                readyShockTargetCount(),
+                this.deferredEdits.size(),
+                stats.scansRemaining,
+                stats.budget
+        );
+    }
+
+    private double minShockSampleFront() {
+        double min = Double.POSITIVE_INFINITY;
+        for (float front : this.sectorSampleFront) {
+            min = Math.min(min, front);
+        }
+        return Double.isFinite(min) ? min : 0.0D;
+    }
+
+    private double maxShockFront() {
+        double max = 0.0D;
+        for (float front : this.sectorFront) {
+            max = Math.max(max, front);
+        }
+        return max;
+    }
+
+    private int readyShockTargetCount() {
+        int count = 0;
+        for (List<ShockTarget> targets : this.readyShockTargets) {
+            count += targets.size();
+        }
+        return count;
+    }
+
     private boolean allSectorsMaxed() {
         for (float front : this.sectorFront) {
             if (front < (float) this.geometry.shockSurfaceRadius() - 0.5F) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean allShockSectorsSampled() {
+        for (int i = 0; i < this.sectorFront.length; i++) {
+            if (this.sectorSampleFront[i] < this.sectorFront[i] - 0.5F) {
                 return false;
             }
         }

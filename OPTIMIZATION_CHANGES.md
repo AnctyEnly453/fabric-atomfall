@@ -1,5 +1,38 @@
 # Atomfall Optimization Changes
 
+## 10. 2026-04-24 Crater and Shockwave Follow-up
+
+### 10.1 Crater core pillar cleanup
+- `ActiveNuclearBlast.prepareCraterEditsAsync` now captures only the circular crater footprint and uses `WORLD_SURFACE` as the top bound.
+- Crater floors use an origin-based bowl in the core, then blend back to local terrain near the rim. This prevents mountain columns from surviving as tall pillars inside the core.
+- Added a budgeted multi-pass crater collapse phase so floating blocks left after excavation are removed across ticks instead of in one blocking pass.
+
+### 10.2 Shockwave completeness fixes
+- Added `sectorSampleFront` persistence so the visual/physics shock front can advance while block damage sampling catches up over later ticks.
+- Loaded columns are marked in `processedSurfaceColumns` / `processedStructureColumns` as soon as they are queued, preventing repeated async batches from spending budget on the same column.
+- Ready shock side effects now keep unprocessed targets when the tick budget runs out instead of clearing the whole queue.
+- Async structure snapshots now use `WORLD_SURFACE` so leaves, trees, and exposed structures are included consistently.
+
+### 10.3 Stronger scoured-surface visuals
+- Surface shock edits now remove top layers and leave a scoured floor made from coarse dirt, gravel, cobblestone, tuff, scorched earth, and related materials.
+- The scoured palette is driven by low-frequency value noise plus radial streak noise instead of per-column random hash, producing broader continuous blast bands and fewer speckled pixels.
+- `shockScourDepth` now uses the same continuous damage/pattern model so depth and material choice match visually.
+
+### 10.4 Chunk-ring shock sampling
+- Replaced sector/radial/lateral shell sampling with radius-ring -> chunk -> chunk-local grid traversal.
+- Ring processing is resumable across ticks with `shockChunkRing*` cursors and remains governed by `shockBlockBudget`.
+- Chunk-ring traversal improves cache locality and avoids dropping unsampled shell slices when the budget is exhausted.
+
+### 10.5 Debug log command
+- Added `/atomfall performance log` to show shock performance-log status.
+- Added `/atomfall performance log on` and `/atomfall performance log off` to control log generation.
+- Added `/atomfall performance log interval <ticks>` to tune the server-log interval.
+- Shock logs are off by default and, when enabled, emit `Atomfall shock perf` lines with front/sample radius, ring range, chunks, sampled columns, queued targets, deferred targets, and queue backlogs.
+
+### 10.6 Profile tuning
+- Updated shock performance defaults: `HIGH_FIDELITY` now uses 96 sectors and a 1600 shock budget; `BALANCED` uses 48 sectors and 1200 budget; `PERFORMANCE` uses 36 sectors and 1000 budget.
+- Mid-range lateral sampling is enabled in the default profile so the visible destruction band is more continuous.
+
 ## 1. 掉落物洪峰修复
 
 - 新增 `BlastWorldMutations.java`：统一使用 `Block.UPDATE_CLIENTS | Block.UPDATE_SUPPRESS_DROPS` 进行无掉落方块更新

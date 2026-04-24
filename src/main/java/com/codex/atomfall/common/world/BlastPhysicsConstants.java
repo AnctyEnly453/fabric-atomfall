@@ -16,9 +16,9 @@ public final class BlastPhysicsConstants {
 
     public enum PerformanceProfile {
 
-        HIGH_FIDELITY("high_fidelity", 72, 5, 10, 14, 1, 0, 0, 1200, 1000, 104, false),
-        BALANCED("balanced", 32, 7, 14, 18, 0, 0, 0, 900, 700, 64, false),
-        PERFORMANCE("performance", 24, 7, 12, 18, 1, 0, 0, 800, 600, 48, false);
+        HIGH_FIDELITY("high_fidelity", 96, 4, 7, 10, 2, 1, 1, 1400, 1600, 128, false),
+        BALANCED("balanced", 48, 5, 9, 12, 1, 1, 0, 1100, 1200, 80, false),
+        PERFORMANCE("performance", 36, 5, 9, 14, 1, 1, 0, 900, 1000, 64, false);
         private final String id;
         private final int shockSectors;
         private final int shockStrideNear;
@@ -109,6 +109,8 @@ public final class BlastPhysicsConstants {
     private static volatile int ovThermalBudget = -1;
     private static volatile int ovWaterBudget = -1;
     private static volatile int ovThermalInterval = -1;
+    private static volatile boolean shockPerfLogEnabled = false;
+    private static volatile int shockPerfLogIntervalTicks = 40;
 
     private BlastPhysicsConstants() {
     }
@@ -211,6 +213,22 @@ public final class BlastPhysicsConstants {
 
     public static boolean useBlockLineOfSight() {
         return activeProfile.blockLineOfSight;
+    }
+
+    public static boolean shockPerfLogEnabled() {
+        return shockPerfLogEnabled;
+    }
+
+    public static void setShockPerfLogEnabled(boolean enabled) {
+        shockPerfLogEnabled = enabled;
+    }
+
+    public static int shockPerfLogIntervalTicks() {
+        return shockPerfLogIntervalTicks;
+    }
+
+    public static void setShockPerfLogIntervalTicks(int ticks) {
+        shockPerfLogIntervalTicks = Math.max(1, ticks);
     }
 
     public static int lateralShellSamples(double radius) {
