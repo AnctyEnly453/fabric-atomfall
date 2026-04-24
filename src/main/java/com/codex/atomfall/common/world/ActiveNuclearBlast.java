@@ -418,7 +418,8 @@ public final class ActiveNuclearBlast {
         }
     }
 
-    private record StructureColumnSnapshot(int x, int z, int radial, double psi, double angle, int roofY, int minY, BlockState[] states, double[] exposures) {
+    private record StructureColumnSnapshot(int x, int z, int radial, double psi, double angle, int roofY, int minY,
+                                           BlockState[] states, double[] exposures, byte[] openSides, boolean[] openAbove) {
         BlockState stateAt(int y) {
             int idx = this.roofY - y;
             return (idx >= 0 && idx < this.states.length) ? this.states[idx] : Blocks.AIR.defaultBlockState();
@@ -426,6 +427,14 @@ public final class ActiveNuclearBlast {
         double exposureAt(int y) {
             int idx = this.roofY - y;
             return (idx >= 0 && idx < this.exposures.length) ? this.exposures[idx] : 1.0D;
+        }
+        int openSidesAt(int y) {
+            int idx = this.roofY - y;
+            return (idx >= 0 && idx < this.openSides.length) ? this.openSides[idx] : 0;
+        }
+        boolean openAboveAt(int y) {
+            int idx = this.roofY - y;
+            return idx >= 0 && idx < this.openAbove.length && this.openAbove[idx];
         }
     }
 
@@ -1028,14 +1037,19 @@ public final class ActiveNuclearBlast {
                     int len = roofY - minY + 1;
                     BlockState[] states = new BlockState[len];
                     double[] exposures = new double[len];
+                    byte[] openSides = new byte[len];
+                    boolean[] openAbove = new boolean[len];
                     double dirX = Math.cos(t.angle);
                     double dirZ = Math.sin(t.angle);
                     for (int y = roofY, i = 0; y >= minY; y--, i++) {
                         m.set(t.x, y, t.z);
                         states[i] = level.getBlockState(m);
-                        exposures[i] = exposureFactor(level, m, dirX, dirZ, roofY);
+                        openSides[i] = (byte) openSideCount(level, m);
+                        openAbove[i] = level.isEmptyBlock(m.above());
+                        exposures[i] = exposureFactor(level, m, states[i], dirX, dirZ, roofY, openSides[i], openAbove[i]);
                     }
-                    structSnaps.add(new StructureColumnSnapshot(t.x, t.z, t.radial, t.psi, t.angle, roofY, minY, states, exposures));
+                    structSnaps.add(new StructureColumnSnapshot(t.x, t.z, t.radial, t.psi, t.angle, roofY, minY,
+                            states, exposures, openSides, openAbove));
                 }
             }
         }
@@ -1299,13 +1313,40 @@ public final class ActiveNuclearBlast {
                 double offsetDistance = Math.sqrt(ox * (double) ox + oz * (double) oz);
                 double falloff = 1.0D - Mth.clamp(offsetDistance / (radius + 1.15D), 0.0D, 1.0D);
                 double offsetPsi = psi * Mth.clamp(0.62D + falloff * 0.25D + edgeNoise * 0.13D, 0.54D, 0.94D);
-                int brushCost = queueShockTarget(targets, nx, nz, radial, offsetPsi, angle, false, false);
+                boolean includeStructural = shouldStructureBrushSample(psi, radial, ox, oz, radius, edgeNoise);
+                int brushCost = queueShockTarget(targets, nx, nz, radial, offsetPsi, angle, includeStructural, false);
                 if (brushCost > 0) {
                     stats.queuedTargets += brushCost;
                     stats.budget -= brushCost;
                 }
             }
         }
+    }
+
+    private boolean shouldStructureBrushSample(double psi, int radial, int ox, int oz, int radius, double noise) {
+        if (psi < 0.65D || radius <= 0) {
+            return false;
+        }
+        int stride = structureBrushStride(psi, radial);
+        int hashed = Math.floorMod(ox * 7349 + oz * 9151 + radial * 3907, stride);
+        if (hashed != 0) {
+            return false;
+        }
+        double offsetDistance = Math.sqrt(ox * (double) ox + oz * (double) oz);
+        if (offsetDistance > radius + 0.25D) {
+            return false;
+        }
+        return psi >= 2.0D || noise > 0.22D;
+    }
+
+    private int structureBrushStride(double psi, int radial) {
+        if (radial <= this.geometry.shockCoreRadius() || psi >= 8.0D) {
+            return 2;
+        }
+        if (radial <= this.geometry.shockSevereRadius() || psi >= 3.0D) {
+            return 3;
+        }
+        return 4;
     }
 
     private int queueShockTarget(List<ShockTarget> targets, int x, int z, int radial, double psi, double angle,
@@ -1488,17 +1529,15 @@ public final class ActiveNuclearBlast {
                 continue;
             }
 
-            if (!isStructuralTarget(level, pos, roofY)) {
+            int openSides = openSideCount(level, pos);
+            boolean openAbove = level.isEmptyBlock(pos.above());
+            if (!isStructuralTarget(state, y, roofY, openSides, openAbove)) {
                 continue;
             }
 
-            double requiredPsi = BlastMaterialRules.blastResistancePsi(state);
-            double exposure = exposureFactor(level, pos, dirX, dirZ, roofY);
-            double effectivePsi = structureShockPsi(psi, radial) * exposure;
-            if (BlastMaterialRules.isVegetationOrLightStructure(state)) {
-                effectivePsi *= 1.55D;
-                requiredPsi *= 0.74D;
-            }
+            double requiredPsi = structureRequiredPsi(state, openSides, openAbove);
+            double exposure = exposureFactor(level, pos, state, dirX, dirZ, roofY, openSides, openAbove);
+            double effectivePsi = structureEffectivePsi(psi, radial, state, exposure, openSides, openAbove);
             if (effectivePsi < requiredPsi) {
                 continue;
             }
@@ -1717,17 +1756,15 @@ public final class ActiveNuclearBlast {
                 continue;
             }
 
-            if (!isStructuralTargetFromSnapshot(state, y, snap.roofY)) {
+            int openSides = snap.openSidesAt(y);
+            boolean openAbove = snap.openAboveAt(y);
+            if (!isStructuralTarget(state, y, snap.roofY, openSides, openAbove)) {
                 continue;
             }
 
-            double requiredPsi = BlastMaterialRules.blastResistancePsi(state);
+            double requiredPsi = structureRequiredPsi(state, openSides, openAbove);
             double exposure = snap.exposureAt(y);
-            double effectivePsi = structureShockPsi(snap.psi, snap.radial) * exposure;
-            if (BlastMaterialRules.isVegetationOrLightStructure(state)) {
-                effectivePsi *= 1.55D;
-                requiredPsi *= 0.74D;
-            }
+            double effectivePsi = structureEffectivePsi(snap.psi, snap.radial, state, exposure, openSides, openAbove);
             if (effectivePsi < requiredPsi) {
                 continue;
             }
@@ -1746,28 +1783,18 @@ public final class ActiveNuclearBlast {
         return edits;
     }
 
-    private static boolean isStructuralTargetFromSnapshot(BlockState state, int y, int roofY) {
+    private static boolean isStructuralTarget(BlockState state, int y, int roofY, int openSides, boolean openAbove) {
         if (BlastMaterialRules.isRoofLike(state) || BlastMaterialRules.isVegetationOrLightStructure(state)
                 || state.is(Blocks.GLASS) || state.is(Blocks.GLASS_PANE)) {
+            return true;
+        }
+        if (openAbove && y >= roofY - 2) {
+            return true;
+        }
+        if (openSides >= 1 && BlastMaterialRules.isStructureShell(state)) {
             return true;
         }
         return y >= roofY - 1;
-    }
-
-    private boolean isStructuralTarget(ServerLevel level, BlockPos pos, int roofY) {
-        BlockState state = level.getBlockState(pos);
-        if (BlastMaterialRules.isRoofLike(state) || BlastMaterialRules.isVegetationOrLightStructure(state)
-                || state.is(Blocks.GLASS) || state.is(Blocks.GLASS_PANE)) {
-            return true;
-        }
-
-        int airNeighbors = 0;
-        for (Direction direction : Direction.values()) {
-            if (level.getBlockState(pos.relative(direction)).isAir()) {
-                airNeighbors++;
-            }
-        }
-        return airNeighbors >= 2 || pos.getY() >= roofY - 1;
     }
 
     private boolean isSurfaceExposed(ServerLevel level, BlockPos pos) {
@@ -1784,10 +1811,25 @@ public final class ActiveNuclearBlast {
     }
 
     private double exposureFactor(ServerLevel level, BlockPos pos, double dirX, double dirZ, int roofY) {
-        double factor = 1.0D;
         BlockState state = level.getBlockState(pos);
+        int openSides = openSideCount(level, pos);
+        boolean openAbove = level.isEmptyBlock(pos.above());
+        return exposureFactor(level, pos, state, dirX, dirZ, roofY, openSides, openAbove);
+    }
+
+    private double exposureFactor(ServerLevel level, BlockPos pos, BlockState state, double dirX, double dirZ,
+                                  int roofY, int openSides, boolean openAbove) {
+        double factor = 1.0D;
         if (BlastMaterialRules.isRoofLike(state)) {
             factor *= 1.24D;
+        }
+        if (openAbove) {
+            factor *= 1.12D;
+        }
+        if (openSides >= 2) {
+            factor *= 1.18D;
+        } else if (openSides == 1) {
+            factor *= 1.08D;
         }
         if (pos.getY() > roofY - 2) {
             factor *= 1.15D;
@@ -1796,12 +1838,7 @@ public final class ActiveNuclearBlast {
             factor *= 0.62D;
         }
 
-        int blockedFaces = 0;
-        for (Direction direction : HORIZONTAL) {
-            if (!level.getBlockState(pos.relative(direction)).isAir()) {
-                blockedFaces++;
-            }
-        }
+        int blockedFaces = HORIZONTAL.length - openSides;
         if (blockedFaces >= 3) {
             factor *= 0.76D;
         }
@@ -1823,20 +1860,68 @@ public final class ActiveNuclearBlast {
         return factor;
     }
 
+    private static int openSideCount(ServerLevel level, BlockPos pos) {
+        int openSides = 0;
+        for (Direction direction : HORIZONTAL) {
+            if (level.getBlockState(pos.relative(direction)).isAir()) {
+                openSides++;
+            }
+        }
+        return openSides;
+    }
+
+    private double structureRequiredPsi(BlockState state, int openSides, boolean openAbove) {
+        double requiredPsi = BlastMaterialRules.blastResistancePsi(state);
+        if (BlastMaterialRules.isLeafLike(state)) {
+            requiredPsi *= 0.42D;
+        } else if (state.is(BlockTags.LOGS)) {
+            requiredPsi *= 0.58D;
+        } else if (BlastMaterialRules.isWoodFraming(state)) {
+            requiredPsi *= 0.66D;
+        } else if (BlastMaterialRules.isVegetationOrLightStructure(state)) {
+            requiredPsi *= 0.70D;
+        } else if (openSides >= 1 && BlastMaterialRules.isStructureShell(state)) {
+            requiredPsi *= 0.86D;
+        }
+        if (openSides >= 2 || openAbove) {
+            requiredPsi *= 0.90D;
+        }
+        return Math.max(0.06D, requiredPsi);
+    }
+
+    private double structureEffectivePsi(double psi, int radial, BlockState state, double exposure, int openSides, boolean openAbove) {
+        double effectivePsi = structureShockPsi(psi, radial) * exposure;
+        if (BlastMaterialRules.isLeafLike(state)) {
+            effectivePsi *= 2.45D;
+        } else if (state.is(BlockTags.LOGS)) {
+            effectivePsi *= 1.95D;
+        } else if (BlastMaterialRules.isWoodFraming(state)) {
+            effectivePsi *= 1.78D;
+        } else if (BlastMaterialRules.isVegetationOrLightStructure(state)) {
+            effectivePsi *= 1.65D;
+        } else if (openSides >= 1 && BlastMaterialRules.isStructureShell(state)) {
+            effectivePsi *= 1.18D;
+        }
+        if (openSides >= 2 || openAbove) {
+            effectivePsi *= 1.08D;
+        }
+        return effectivePsi;
+    }
+
     private int structureScanDepth(double psi) {
         if (psi >= 15.0D) {
-            return 48;
+            return 56;
         }
         if (psi >= 8.0D) {
-            return 36;
+            return 42;
         }
         if (psi >= 4.0D) {
-            return 26;
+            return 32;
         }
         if (psi >= 2.0D) {
-            return 18;
+            return 22;
         }
-        return 12;
+        return 16;
     }
 
     private int shockScourDepth(double psi, int radial, int x, int z) {
@@ -1952,18 +2037,18 @@ public final class ActiveNuclearBlast {
 
     private int maxStructureEdits(double psi) {
         if (psi >= 15.0D) {
-            return 64;
+            return 82;
         }
         if (psi >= 8.0D) {
-            return 48;
+            return 64;
         }
         if (psi >= 4.0D) {
-            return 32;
+            return 44;
         }
         if (psi >= 2.0D) {
-            return 20;
+            return 30;
         }
-        return 14;
+        return 20;
     }
 
     private void damageEntities(ServerLevel level) {

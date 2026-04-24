@@ -51,6 +51,11 @@
 - Updated shock performance defaults: `HIGH_FIDELITY` now uses 96 sectors and a 1600 shock budget; `BALANCED` uses 48 sectors and 1200 budget; `PERFORMANCE` uses 36 sectors and 1000 budget.
 - Mid-range lateral sampling is enabled in the default profile so the visible destruction band is more continuous.
 
+### 10.9 Vegetation and structure damage
+- Shock footprint brush samples now include deterministic structural sub-samples instead of limiting structural damage to only the center sample.
+- Vegetation, leaves, logs, and wood framing use stronger structural damage multipliers and lower effective failure thresholds.
+- Structure snapshots now capture horizontal open-side counts and above-air exposure so async damage can peel exterior walls, roofs, glass, and weak masonry more consistently.
+
 ## 1. 掉落物洪峰修复
 
 - 新增 `BlastWorldMutations.java`：统一使用 `Block.UPDATE_CLIENTS | Block.UPDATE_SUPPRESS_DROPS` 进行无掉落方块更新

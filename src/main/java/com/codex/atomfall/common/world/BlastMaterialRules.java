@@ -95,10 +95,34 @@ public final class BlastMaterialRules {
                 || state.is(Blocks.POPPY);
     }
 
+    public static boolean isLeafLike(BlockState state) {
+        return state.is(BlockTags.LEAVES) || state.is(Blocks.SHORT_GRASS) || state.is(Blocks.TALL_GRASS)
+                || state.is(Blocks.FERN) || state.is(Blocks.LARGE_FERN) || state.is(Blocks.VINE);
+    }
+
+    public static boolean isWoodFraming(BlockState state) {
+        return state.is(BlockTags.LOGS) || state.is(BlockTags.PLANKS) || state.is(BlockTags.WOODEN_DOORS)
+                || state.is(BlockTags.WOODEN_TRAPDOORS) || state.is(Blocks.BARREL)
+                || state.is(Blocks.CRAFTING_TABLE) || state.is(Blocks.BOOKSHELF);
+    }
+
     public static boolean isVegetationOrLightStructure(BlockState state) {
         return state.is(BlockTags.LEAVES) || state.is(BlockTags.LOGS) || state.is(BlockTags.PLANKS)
                 || state.is(BlockTags.WOOL) || state.is(Blocks.HAY_BLOCK) || state.is(Blocks.BOOKSHELF)
                 || state.is(BlockTags.DOORS) || state.is(BlockTags.FENCES) || state.is(BlockTags.TRAPDOORS);
+    }
+
+    public static boolean isMasonryStructure(BlockState state) {
+        return state.is(Blocks.BRICKS) || state.is(Blocks.BRICK_STAIRS) || state.is(Blocks.BRICK_WALL)
+                || state.is(Blocks.BRICK_SLAB) || state.is(Blocks.STONE_BRICKS)
+                || state.is(Blocks.STONE_BRICK_STAIRS) || state.is(Blocks.STONE_BRICK_WALL)
+                || state.is(Blocks.STONE_BRICK_SLAB) || state.is(Blocks.COBBLESTONE)
+                || state.is(Blocks.COBBLESTONE_WALL);
+    }
+
+    public static boolean isStructureShell(BlockState state) {
+        return isRoofLike(state) || isVegetationOrLightStructure(state) || isMasonryStructure(state)
+                || state.is(Blocks.GLASS) || state.is(Blocks.GLASS_PANE) || state.is(Blocks.TINTED_GLASS);
     }
 
     /**
