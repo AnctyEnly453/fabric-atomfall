@@ -7,7 +7,6 @@ import com.mojang.serialization.Codec;
 import com.mojang.serialization.codecs.RecordCodecBuilder;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
-import net.minecraft.core.particles.BlockParticleOption;
 import net.minecraft.core.particles.ParticleTypes;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -64,9 +63,6 @@ public final class ActiveNuclearBlast {
     private static final int CRATER_COLLAPSE_MAX_PASSES = 8;
     private static final double MIN_SURFACE_SHOCK_PSI = 0.22D;
     private static final double MIN_STRUCTURE_SHOCK_PSI = 0.42D;
-    private static final int MAX_STRUCTURAL_SNAPS_PER_TICK = 120;
-    private static final int MAX_SHOCK_APPLY_PER_TICK = 2400;
-    private static final int MAX_WATER_BOILS_PER_TICK = 3;
     private static final ExecutorService COMPUTE_EXECUTOR = createComputeExecutor();
 
     private final BlockPos origin;
@@ -1026,12 +1022,8 @@ public final class ActiveNuclearBlast {
         List<SurfaceColumnSnapshot> surfaceSnaps = new ArrayList<>();
         List<StructureColumnSnapshot> structSnaps = new ArrayList<>();
         BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
-        int structSnapCount = 0;
-        List<ShockTarget> batchTargets = new ArrayList<>(targets.size());
 
         for (ShockTarget t : targets) {
-            boolean needsSurface = t.needsSurface;
-            boolean needsStructural = t.needsStructural;
             if (needsSurface) {
                 int surfaceY = this.initialSurface.getOrCapture(level, t.x, t.z);
                 int floorY = Math.max(level.getMinY() + 4, surfaceY - shockScourDepth(t.psi, t.radial, t.x, t.z));
@@ -1051,40 +1043,33 @@ public final class ActiveNuclearBlast {
                 surfaceSnaps.add(new SurfaceColumnSnapshot(t.x, t.z, t.radial, t.psi, surfaceY, floorY, states, thresholds));
             }
             if (needsStructural) {
-                if (structSnapCount < MAX_STRUCTURAL_SNAPS_PER_TICK) {
-                    int terrainY = this.initialSurface.getOrCapture(level, t.x, t.z);
-                    int roofY = level.getHeight(Heightmap.Types.WORLD_SURFACE, t.x, t.z) - 1;
-                    int minY = structureScanMinY(level, t.x, t.z, terrainY, roofY, t.psi);
-                    if (roofY >= minY) {
-                        int len = roofY - minY + 1;
-                        BlockState[] states = new BlockState[len];
-                        double[] exposures = new double[len];
-                        byte[] openSides = new byte[len];
-                        boolean[] openAbove = new boolean[len];
-                        double dirX = Math.cos(t.angle);
-                        double dirZ = Math.sin(t.angle);
-                        for (int y = roofY, i = 0; y >= minY; y--, i++) {
-                            m.set(t.x, y, t.z);
-                            states[i] = level.getBlockState(m);
-                            openSides[i] = (byte) openSideCount(level, m);
-                            openAbove[i] = level.isEmptyBlock(m.above());
-                            exposures[i] = exposureFactor(level, m, states[i], dirX, dirZ, roofY, openSides[i], openAbove[i]);
-                        }
-                        structSnaps.add(new StructureColumnSnapshot(t.x, t.z, t.radial, t.psi, t.angle, terrainY, roofY, minY,
-                                states, exposures, openSides, openAbove));
+                int terrainY = this.initialSurface.getOrCapture(level, t.x, t.z);
+                int roofY = level.getHeight(Heightmap.Types.WORLD_SURFACE, t.x, t.z) - 1;
+                int minY = structureScanMinY(level, t.x, t.z, terrainY, roofY, t.psi);
+                if (roofY >= minY) {
+                    int len = roofY - minY + 1;
+                    BlockState[] states = new BlockState[len];
+                    double[] exposures = new double[len];
+                    byte[] openSides = new byte[len];
+                    boolean[] openAbove = new boolean[len];
+                    double dirX = Math.cos(t.angle);
+                    double dirZ = Math.sin(t.angle);
+                    for (int y = roofY, i = 0; y >= minY; y--, i++) {
+                        m.set(t.x, y, t.z);
+                        states[i] = level.getBlockState(m);
+                        openSides[i] = (byte) openSideCount(level, m, dirX, dirZ);
+                        openAbove[i] = level.isEmptyBlock(m.above());
+                        exposures[i] = exposureFactor(level, m, states[i], dirX, dirZ, roofY, openSides[i], openAbove[i]);
                     }
-                    structSnapCount++;
-                } else {
-                    queueDeferredEdit(new PendingEdit(t.x, t.z, t.radial, t.psi, t.angle, true), false);
-                    needsStructural = false;
+                    structSnaps.add(new StructureColumnSnapshot(t.x, t.z, t.radial, t.psi, t.angle, terrainY, roofY, minY,
+                            states, exposures, openSides, openAbove));
                 }
             }
-            batchTargets.add(new ShockTarget(t.x, t.z, t.radial, t.psi, t.angle, needsSurface, needsStructural, t.sideEffects));
         }
 
         this.pendingShockBatches.add(new PendingShockBatch(
                 submitShockEdits(surfaceSnaps, structSnaps),
-                batchTargets
+                new ArrayList<>(targets)
         ));
     }
 
@@ -1588,7 +1573,7 @@ public final class ActiveNuclearBlast {
         for (int y = roofY, i = 0; y >= minY; y--, i++) {
             pos.set(x, y, z);
             states[i] = level.getBlockState(pos);
-            openSides[i] = (byte) openSideCount(level, pos);
+            openSides[i] = (byte) openSideCount(level, pos, dirX, dirZ);
             openAbove[i] = level.isEmptyBlock(pos.above());
             exposures[i] = exposureFactor(level, pos, states[i], dirX, dirZ, roofY, openSides[i], openAbove[i]);
         }
@@ -1787,12 +1772,20 @@ public final class ActiveNuclearBlast {
 
     private List<BlockEdit> computeStructureEdits(StructureColumnSnapshot snap) {
         List<BlockEdit> edits = new ArrayList<>();
-        double dirX = Math.cos(snap.angle);
-        double dirZ = Math.sin(snap.angle);
+        boolean treeColumn = hasTreeMaterial(snap);
+        if (treeColumn) {
+            appendTreeDamageEdits(snap, edits);
+        }
 
         for (int y = snap.roofY; y >= snap.minY; y--) {
+            if (edits.size() >= maxStructureEdits(snap.psi)) {
+                break;
+            }
             BlockState state = snap.stateAt(y);
             if (state.isAir() || state.hasBlockEntity()) {
+                continue;
+            }
+            if (treeColumn && isTreeMaterial(state)) {
                 continue;
             }
 
@@ -1821,6 +1814,94 @@ public final class ActiveNuclearBlast {
         }
 
         return edits;
+    }
+
+    private boolean hasTreeMaterial(StructureColumnSnapshot snap) {
+        for (int y = snap.roofY; y >= snap.minY; y--) {
+            BlockState state = snap.stateAt(y);
+            if (state.is(BlockTags.LOGS)) {
+                return true;
+            }
+            if (state.is(BlockTags.LEAVES) && y > snap.terrainY + 1) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void appendTreeDamageEdits(StructureColumnSnapshot snap, List<BlockEdit> edits) {
+        double dynamicPsi = treeDynamicPsi(snap);
+        if (dynamicPsi < 0.38D) {
+            return;
+        }
+
+        int maxEdits = maxStructureEdits(snap.psi);
+        int fractureY = treeFractureY(snap, dynamicPsi);
+
+        for (int y = snap.roofY; y >= snap.minY && edits.size() < maxEdits; y--) {
+            BlockState state = snap.stateAt(y);
+            if (!state.is(BlockTags.LOGS) || y <= fractureY) {
+                continue;
+            }
+            double damage = treeDamage(snap, y, dynamicPsi);
+            if (dynamicPsi >= 7.0D || damage >= 0.40D) {
+                edits.add(new BlockEdit(BlockPos.asLong(snap.x, y, snap.z), null, true));
+            }
+        }
+
+        for (int y = snap.roofY; y >= snap.minY && edits.size() < maxEdits; y--) {
+            BlockState state = snap.stateAt(y);
+            if (!isTreeCanopy(state)) {
+                continue;
+            }
+            double damage = treeDamage(snap, y, dynamicPsi);
+            double threshold = y >= fractureY ? 0.16D : 0.34D;
+            if (dynamicPsi >= 1.15D || damage >= threshold) {
+                edits.add(new BlockEdit(BlockPos.asLong(snap.x, y, snap.z), null, true));
+            }
+        }
+    }
+
+    private double treeDynamicPsi(StructureColumnSnapshot snap) {
+        double height = Math.max(0.0D, snap.roofY - snap.terrainY);
+        double heightBoost = Mth.clamp(height / 24.0D, 0.0D, 0.45D);
+        double severeBoost = snap.radial <= this.geometry.shockSevereRadius() ? 0.18D : 0.0D;
+        return structureShockPsi(snap.psi, snap.radial) * (1.05D + heightBoost + severeBoost);
+    }
+
+    private int treeFractureY(StructureColumnSnapshot snap, double dynamicPsi) {
+        int jitter = Mth.floor(shockValueNoise(snap.x * 0.11D, snap.z * 0.11D, 907) * 4.0D);
+        int stumpY;
+        if (dynamicPsi >= 9.0D || snap.radial <= this.geometry.shockCoreRadius() * 0.75D) {
+            stumpY = snap.terrainY + 1 + (jitter & 1);
+        } else if (dynamicPsi >= 5.0D) {
+            stumpY = snap.terrainY + 2 + jitter;
+        } else if (dynamicPsi >= 2.2D) {
+            stumpY = snap.terrainY + 4 + jitter * 2;
+        } else if (dynamicPsi >= 1.0D) {
+            stumpY = snap.terrainY + 7 + jitter * 3;
+        } else {
+            stumpY = snap.roofY + 1;
+        }
+        return Mth.clamp(stumpY, snap.terrainY + 1, snap.roofY + 1);
+    }
+
+    private double treeDamage(StructureColumnSnapshot snap, int y, double dynamicPsi) {
+        double pressure = Mth.clamp((dynamicPsi - 0.30D) / 4.8D, 0.0D, 1.0D);
+        double heightSpan = Math.max(4.0D, snap.roofY - snap.terrainY);
+        double height = Mth.clamp((y - snap.terrainY) / heightSpan, 0.0D, 1.0D);
+        double severe = 1.0D - Mth.clamp(snap.radial / Math.max(1.0D, this.geometry.shockSevereRadius()), 0.0D, 1.0D);
+        double patch = shockValueNoise(snap.x * 0.095D + y * 0.013D, snap.z * 0.095D, 947) - 0.5D;
+        double streak = shockRadialNoise(snap.x, snap.z, 977) - 0.5D;
+        return Mth.clamp(pressure * 0.66D + height * 0.22D + severe * 0.18D + patch * 0.20D + streak * 0.16D, 0.0D, 1.0D);
+    }
+
+    private static boolean isTreeMaterial(BlockState state) {
+        return state.is(BlockTags.LOGS) || isTreeCanopy(state);
+    }
+
+    private static boolean isTreeCanopy(BlockState state) {
+        return state.is(BlockTags.LEAVES) || state.is(Blocks.VINE);
     }
 
     private static boolean isStructuralTarget(BlockState state, int y, int roofY, int openSides, boolean openAbove) {
@@ -1910,6 +1991,20 @@ public final class ActiveNuclearBlast {
         return openSides;
     }
 
+    private static int openSideCount(ServerLevel level, BlockPos pos, double dirX, double dirZ) {
+        int openSides = 0;
+        Direction primary = Math.abs(dirX) > Math.abs(dirZ)
+                ? (dirX > 0 ? Direction.EAST : Direction.WEST)
+                : (dirZ > 0 ? Direction.SOUTH : Direction.NORTH);
+        if (level.getBlockState(pos.relative(primary)).isAir()) {
+            openSides++;
+        }
+        if (level.getBlockState(pos.relative(primary.getOpposite())).isAir()) {
+            openSides++;
+        }
+        return openSides;
+    }
+
     private double structureRequiredPsi(BlockState state, int openSides, boolean openAbove) {
         double requiredPsi = BlastMaterialRules.blastResistancePsi(state);
         if (BlastMaterialRules.isLeafLike(state)) {
@@ -1962,6 +2057,17 @@ public final class ActiveNuclearBlast {
             return 22;
         }
         return 16;
+    }
+
+    private int structureScanMinY(ServerLevel level, int x, int z, int terrainY, int roofY, double psi) {
+        int depth = structureScanDepth(psi);
+        if (roofY > terrainY + 2) {
+            BlockState roofState = level.getBlockState(new BlockPos(x, roofY, z));
+            if (isTreeMaterial(roofState)) {
+                depth = Math.max(depth, Math.min(96, roofY - terrainY + 4));
+            }
+        }
+        return Math.max(level.getMinY() + 1, roofY - depth);
     }
 
     private int shockScourDepth(double psi, int radial, int x, int z) {
@@ -2077,24 +2183,21 @@ public final class ActiveNuclearBlast {
 
     private int maxStructureEdits(double psi) {
         if (psi >= 15.0D) {
-            return 82;
+            return 128;
         }
         if (psi >= 8.0D) {
-            return 64;
+            return 104;
         }
         if (psi >= 4.0D) {
-            return 44;
+            return 78;
         }
         if (psi >= 2.0D) {
-            return 30;
+            return 52;
         }
-        return 20;
+        return 32;
     }
 
     private void damageEntities(ServerLevel level) {
-        if (this.ageTicks % 2 != 0) {
-            return;
-        }
         double min = this.previousAverageFront - shellWidth(this.previousAverageFront);
         double max = this.averageFront + shellWidth(this.averageFront);
         AABB bounds = new AABB(
@@ -2246,7 +2349,6 @@ public final class ActiveNuclearBlast {
         }
         int budget = BlastPhysicsConstants.shockBlockBudget();
         int startBudget = budget;
-        int waterBoilsRemaining = MAX_WATER_BOILS_PER_TICK;
         java.util.Iterator<List<ShockTarget>> batchIterator = this.readyShockTargets.iterator();
         while (batchIterator.hasNext() && budget > 0) {
             List<ShockTarget> targets = batchIterator.next();
@@ -2262,12 +2364,11 @@ public final class ActiveNuclearBlast {
                 }
                 int surfaceY = this.initialSurface.getOrCapture(level, target.x, target.z);
                 BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos(target.x, surfaceY, target.z);
-                if (target.psi >= 3.0D && waterBoilsRemaining > 0 && level.getBlockState(pos).getFluidState().is(FluidTags.WATER)) {
+                if (target.psi >= 3.0D && level.getBlockState(pos).getFluidState().is(FluidTags.WATER)) {
                     BlockPos waterSeed = WaterEvaporationUtil.findWaterSeed(level, target.x, target.z, 24);
                     if (waterSeed != null) {
                         flashBoilWater(level, waterSeed, target.psi);
                         budget -= 4;
-                        waterBoilsRemaining--;
                     }
                 }
                 if (target.radial <= this.geometry.scorchRadius() && target.psi >= 0.6D) {
@@ -2618,15 +2719,15 @@ public final class ActiveNuclearBlast {
         int baseBudget = BlastPhysicsConstants.shockBlockBudget();
         int queued = this.shockEditQueue.size();
         if (queued > 250_000) {
-            return Math.min(baseBudget * 4, MAX_SHOCK_APPLY_PER_TICK);
+            return baseBudget * 4;
         }
         if (queued > 100_000) {
-            return Math.min(baseBudget * 3, MAX_SHOCK_APPLY_PER_TICK);
+            return baseBudget * 3;
         }
         if (queued > 25_000) {
-            return Math.min(baseBudget * 2, MAX_SHOCK_APPLY_PER_TICK);
+            return baseBudget * 2;
         }
-        return Math.min(baseBudget, MAX_SHOCK_APPLY_PER_TICK);
+        return baseBudget;
     }
 
     private int craterMutationBudget() {

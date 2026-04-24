@@ -13,6 +13,8 @@ import net.minecraft.world.level.block.state.BlockState;
  * still cheap enough for kilometer-scale shells.
  */
 public final class BlastMaterialRules {
+    private static final it.unimi.dsi.fastutil.objects.Object2DoubleOpenHashMap<BlockState> SURFACE_FAILURE_CACHE = new it.unimi.dsi.fastutil.objects.Object2DoubleOpenHashMap<>();
+
     private BlastMaterialRules() {
     }
 
@@ -141,8 +143,12 @@ public final class BlastMaterialRules {
      * surface overpressure without the whole mountain behaving like a building.
      */
     public static double surfaceFailurePsi(ServerLevel level, BlockPos pos, BlockState state) {
+        if (SURFACE_FAILURE_CACHE.containsKey(state)) {
+            return SURFACE_FAILURE_CACHE.getDouble(state);
+        }
         float destroySpeed = state.getDestroySpeed(level, pos);
         if (destroySpeed < 0.0F) {
+            SURFACE_FAILURE_CACHE.put(state, Double.POSITIVE_INFINITY);
             return Double.POSITIVE_INFINITY;
         }
 
@@ -159,7 +165,9 @@ public final class BlastMaterialRules {
             threshold *= 1.12D;
         }
 
-        return Math.max(0.25D, threshold);
+        double result = Math.max(0.25D, threshold);
+        SURFACE_FAILURE_CACHE.put(state, result);
+        return result;
     }
 
     public static boolean isRockLike(BlockState state) {
