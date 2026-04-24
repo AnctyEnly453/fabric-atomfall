@@ -215,6 +215,9 @@ public final class ActiveNuclearBlast {
     private record BlockEdit(long packedPos, BlockState newState, boolean remove) {
         boolean apply(ServerLevel level, BlockPos.MutableBlockPos mutable) {
             mutable.set(BlockPos.getX(this.packedPos), BlockPos.getY(this.packedPos), BlockPos.getZ(this.packedPos));
+            if (!level.hasChunk(mutable.getX() >> 4, mutable.getZ() >> 4)) {
+                return false;
+            }
             BlockState current = level.getBlockState(mutable);
             if (current.isAir() || current.is(Blocks.BEDROCK) || current.hasBlockEntity()) {
                 return false;
@@ -2211,6 +2214,9 @@ public final class ActiveNuclearBlast {
                 ShockTarget target = targetIterator.next();
                 if (!target.needsSurface) {
                     targetIterator.remove();
+                    continue;
+                }
+                if (!level.hasChunk(target.x >> 4, target.z >> 4)) {
                     continue;
                 }
                 int surfaceY = this.initialSurface.getOrCapture(level, target.x, target.z);

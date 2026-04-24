@@ -15,6 +15,7 @@ public final class ThermalPulseRingEntity extends Entity {
     private static final EntityDataAccessor<Float> DATA_RADIUS = SynchedEntityData.defineId(ThermalPulseRingEntity.class, EntityDataSerializers.FLOAT);
     private static final EntityDataAccessor<Float> DATA_MAX_RADIUS = SynchedEntityData.defineId(ThermalPulseRingEntity.class, EntityDataSerializers.FLOAT);
     private static final EntityDataAccessor<Float> DATA_CORE_RADIUS = SynchedEntityData.defineId(ThermalPulseRingEntity.class, EntityDataSerializers.FLOAT);
+    private static final int LINGER_TICKS = 160;
 
     private float previousRadius;
 
@@ -59,8 +60,10 @@ public final class ThermalPulseRingEntity extends Entity {
         super.tick();
         this.previousRadius = this.getRadius();
         float speed = Math.max(24.0F, this.getMaxRadius() / 36.0F);
-        this.entityData.set(DATA_RADIUS, this.previousRadius + speed);
-        if (this.getRadius() >= this.getMaxRadius()) {
+        if (this.previousRadius < this.getMaxRadius()) {
+            this.entityData.set(DATA_RADIUS, Math.min(this.getMaxRadius(), this.previousRadius + speed));
+        }
+        if (this.previousRadius >= this.getMaxRadius() && this.tickCount > LINGER_TICKS) {
             this.discard();
         }
     }

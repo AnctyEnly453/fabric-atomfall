@@ -34,7 +34,7 @@ public final class ModEntities {
             EntityType.Builder.<ThermalPulseRingEntity>of(ThermalPulseRingEntity::new, MobCategory.MISC)
                     .fireImmune()
                     .sized(1.0F, 0.2F)
-                    .clientTrackingRange(256)
+                    .clientTrackingRange(4096)
                     .updateInterval(1));
 
     private ModEntities() {
