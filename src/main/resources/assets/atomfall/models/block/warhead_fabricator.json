@@ -1,0 +1,8 @@
+{
+  "parent": "minecraft:block/orientable",
+  "textures": {
+    "top": "atomfall:block/warhead_fabricator_top",
+    "front": "atomfall:block/warhead_fabricator_front",
+    "side": "atomfall:block/warhead_fabricator_side"
+  }
+}

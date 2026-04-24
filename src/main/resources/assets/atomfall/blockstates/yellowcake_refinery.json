@@ -1,0 +1,8 @@
+{
+  "variants": {
+    "facing=north": { "model": "atomfall:block/yellowcake_refinery" },
+    "facing=east": { "model": "atomfall:block/yellowcake_refinery", "y": 90 },
+    "facing=south": { "model": "atomfall:block/yellowcake_refinery", "y": 180 },
+    "facing=west": { "model": "atomfall:block/yellowcake_refinery", "y": 270 }
+  }
+}

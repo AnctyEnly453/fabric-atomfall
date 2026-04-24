@@ -1,0 +1,8 @@
+{
+  "variants": {
+    "facing=north": { "model": "atomfall:block/isotopic_centrifuge" },
+    "facing=east": { "model": "atomfall:block/isotopic_centrifuge", "y": 90 },
+    "facing=south": { "model": "atomfall:block/isotopic_centrifuge", "y": 180 },
+    "facing=west": { "model": "atomfall:block/isotopic_centrifuge", "y": 270 }
+  }
+}

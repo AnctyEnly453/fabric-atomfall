@@ -1,0 +1,8 @@
+{
+  "parent": "minecraft:block/cube_bottom_top",
+  "textures": {
+    "bottom": "atomfall:block/extinction_bomb_bottom",
+    "side": "atomfall:block/extinction_bomb_side",
+    "top": "atomfall:block/extinction_bomb_top"
+  }
+}

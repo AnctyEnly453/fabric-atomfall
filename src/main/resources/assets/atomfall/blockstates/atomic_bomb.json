@@ -1,0 +1,34 @@
+{
+  "variants": {
+    "armed=false,facing=north": {
+      "model": "atomfall:block/atomic_bomb"
+    },
+    "armed=false,facing=east": {
+      "model": "atomfall:block/atomic_bomb",
+      "y": 90
+    },
+    "armed=false,facing=south": {
+      "model": "atomfall:block/atomic_bomb",
+      "y": 180
+    },
+    "armed=false,facing=west": {
+      "model": "atomfall:block/atomic_bomb",
+      "y": 270
+    },
+    "armed=true,facing=north": {
+      "model": "atomfall:block/atomic_bomb"
+    },
+    "armed=true,facing=east": {
+      "model": "atomfall:block/atomic_bomb",
+      "y": 90
+    },
+    "armed=true,facing=south": {
+      "model": "atomfall:block/atomic_bomb",
+      "y": 180
+    },
+    "armed=true,facing=west": {
+      "model": "atomfall:block/atomic_bomb",
+      "y": 270
+    }
+  }
+}

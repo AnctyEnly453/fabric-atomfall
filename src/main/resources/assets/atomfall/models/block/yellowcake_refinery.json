@@ -1,0 +1,8 @@
+{
+  "parent": "minecraft:block/orientable",
+  "textures": {
+    "top": "atomfall:block/yellowcake_refinery_top",
+    "front": "atomfall:block/yellowcake_refinery_front",
+    "side": "atomfall:block/yellowcake_refinery_side"
+  }
+}

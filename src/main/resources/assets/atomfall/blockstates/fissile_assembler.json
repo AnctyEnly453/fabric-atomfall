@@ -1,0 +1,8 @@
+{
+  "variants": {
+    "facing=north": { "model": "atomfall:block/fissile_assembler" },
+    "facing=east": { "model": "atomfall:block/fissile_assembler", "y": 90 },
+    "facing=south": { "model": "atomfall:block/fissile_assembler", "y": 180 },
+    "facing=west": { "model": "atomfall:block/fissile_assembler", "y": 270 }
+  }
+}

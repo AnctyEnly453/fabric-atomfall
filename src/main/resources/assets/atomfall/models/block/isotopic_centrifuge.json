@@ -1,0 +1,8 @@
+{
+  "parent": "minecraft:block/orientable",
+  "textures": {
+    "top": "atomfall:block/isotopic_centrifuge_top",
+    "front": "atomfall:block/isotopic_centrifuge_front",
+    "side": "atomfall:block/isotopic_centrifuge_side"
+  }
+}

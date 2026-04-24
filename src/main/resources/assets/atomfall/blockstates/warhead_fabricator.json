@@ -1,0 +1,8 @@
+{
+  "variants": {
+    "facing=north": { "model": "atomfall:block/warhead_fabricator" },
+    "facing=east": { "model": "atomfall:block/warhead_fabricator", "y": 90 },
+    "facing=south": { "model": "atomfall:block/warhead_fabricator", "y": 180 },
+    "facing=west": { "model": "atomfall:block/warhead_fabricator", "y": 270 }
+  }
+}

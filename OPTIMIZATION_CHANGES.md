@@ -1,0 +1,115 @@
+# Atomfall Optimization Changes
+
+## 1. 掉落物洪峰修复
+
+- 新增 `BlastWorldMutations.java`：统一使用 `Block.UPDATE_CLIENTS | Block.UPDATE_SUPPRESS_DROPS` 进行无掉落方块更新
+- 替换 `TemperatureZone`、`WaterEvaporationUtil`、`ScorchedEarthBlock` 中的直接 `removeBlock` / `setBlock(..., 3)`
+
+## 2. 冲击波/弹坑异步化
+
+- `ActiveNuclearBlast.java`：新增专用线程池 `COMPUTE_EXECUTOR`
+- crater 和 shock 的 `BlockEdit` 计算改为后台线程执行，主线程只负责生成 snapshot、轮询 future、按预算应用结果
+
+## 3. 辐射/温度采样减负
+
+- `RadiationSavedData` / `TemperatureSavedData`：改为继承 `SavedData`，使用 `SavedDataType` + `Codec` 持久化到磁盘
+- `RadiationSystem` / `TemperatureSystem`：玩家采样短周期缓存，非玩家实体低频率采样
+- `AtomfallEvents`：降低附近实体环境扫描频率（每 10 tick）
+
+## 4. 坑体核心区打开速度
+
+- `BlockEdit.apply(...)` 返回是否真正完成有效修改，无效编辑不消耗预算
+- crater 列按距中心排序，优先打开核心区
+- 前 5 tick 使用 6 倍预算、前 20 tick 使用 3 倍预算
+
+## 5. 冲击波持久化
+
+- 新增 `ActiveBlastSavedData.java`：用 `SavedData` 存储活动爆炸
+- `ActiveNuclearBlast` 增加 `PersistenceState`，持久化前沿、能量、队列、deferred edits、surface height 等
+- `SurfaceHeightCache` 增加快照和恢复能力
+
+## 6. 温度效果增强与独立控制
+
+- 新增 `/atomfall heatwave` 指令：只生成温度区，不触发核爆/冲击波/弹坑/辐射
+- `processEnvironment` 采样密度：`min(budget*2, 60 + radius*0.35)`
+- 核爆默认温度参数增强：`thermalRadius` ×1.4，`maxTemperatureC` ×1.25，寿命 60→120 秒
+- `PerformanceProfile` 与 `ThermalProfile` 完全分离，各自独立调控
+- 新增 `/atomfall thermal` 子命令和细粒度 `set` / `reset` override 机制
+
+## 7. 严重 Bug 修复
+
+### 7.1 冲击波永不过期
+- 终止条件从 `averageFront >= shockSurfaceRadius + 64` 改为 `craterFinished && allSectorsMaxed() && ageTicks > 20`
+- 增加安全超时：`ageTicks > shockSurfaceRadius / soundSpeed + 800`
+
+### 7.2 实体死亡内存泄漏
+- `ENTITY_UNLOAD` 只在区块卸载时触发，实体被杀死不触发
+- 新增 `ServerLivingEntityEvents.AFTER_DEATH` 清理非玩家实体的辐射/温度数据
+
+### 7.3 辐射/温度区数据不持久化
+- `RadiationSavedData` / `TemperatureSavedData` 继承 `SavedData`，重启后区域和进度保留
+
+### 7.4 `RadiationSicknessEffect` 伤害间隔不一致
+- 删除 `applyEffectTick` 中的 `tickCount %` 检查，统一由 `shouldApplyEffectTickThisTick` 控制
+
+### 7.5 客户端辐射覆盖层误触发
+- 客户端覆盖层改为检查 `RADIATION_SICKNESS` 效果（而非 POISON/WITHER/NAUSEA）
+- `RadiationSystem.applySymptoms` 在辐射率 ≥0.02 时施加自定义 `RADIATION_SICKNESS`
+
+### 7.6 DetonatorItem 无效链接默认位置
+- `readLinks` 中读取 `Pos` 时校验 `Long.MIN_VALUE`，跳过无效条目
+
+### 7.7 冲击波每列只处理一次
+- `processedSurfaceColumns` / `processedStructureColumns` 从 `LongOpenHashSet` 改为 `Long2DoubleOpenHashMap`
+- 记录每列最大 psi，当 `currentPsi > storedPsi + 1.5` 时重新处理
+
+### 7.8 弹坑柱子
+- `prepareCraterEditsAsync` 预加载所有弹坑范围内 chunk，确保 `initialY` 精确
+- 新增 `collapseCraterFloatingBlocks()`，3 轮 budget-limited 清理浮空方块
+
+### 7.9 水蒸发与树叶烧毁失效
+- 删除 `WaterEvaporationUtil.removeWaterNode` 中 `pos.equals(seed)` 特殊分支
+- `TemperatureZone.processEnvironment` 覆盖层扫描从 `dy=1..2` 扩大到 `dy=1..8`，遇 LOGS 额外扫描树冠
+
+### 7.10 弹坑 chunk key 打包错误
+- `((long)(x >> 4) << 32) ^ (z >> 4)` 改为 `ChunkPos.asLong()`，避免负坐标符号扩展问题
+
+## 8. 性能优化
+
+### 8.1 Chunk 加载阻塞
+- `terrainAdvanceFactor`、`emitShellParticles`、`processEnvironment` 均增加 `hasChunk` 前置检查
+- `SurfaceHeightCache.getOrCapture` 内部再加 `hasChunk` 保护，未加载返回 `seaLevel`
+
+### 8.2 辐射 `level.clip()` 双重计算
+- 删除 `RadiationZone.shelterFactor()` 中的 `level.clip()`，保留步进循环衰减
+
+### 8.3 温度 `shielding()` 光线追踪
+- `TemperatureZone.shielding()` 改为 `level.canSeeSky()`，从光线追踪降级为高度表查询
+
+### 8.4 deferredEdits 去重
+- 新增 `LongOpenHashSet deferredColumns`，确保同一 `(x,z)` 列只加入一次
+
+### 8.5 `processReadyShockTargets` Budget 控制
+- 分配独立 `shockBlockBudget()`，避免副作用（水蒸发、点火、边缘扰动）单 tick 过量执行
+
+### 8.6 PERFORMANCE 模式参数调整
+- `shockSectors` 20→24，`strideNear/Mid/Far` 10/16/22→7/12/18，`lateralNear` 0→1
+- `craterBudget` 600→800，`shockBudget` 400→600，`thermalBudget` 32→80
+
+### 8.7 Structure 扫描增强
+- `structureScanDepth`：30/22/16/12/8 → 48/36/26/18/12
+- `maxStructureEdits`：28/18/12/8 → 64/48/32/20/14
+- `processStructureColumn` 改用 `WORLD_SURFACE` heightmap（包含树叶）
+
+### 8.8 客户端覆盖层实体查询缓存
+- `AtomfallOverlay` 每 2 帧更新一次实体列表，合并三次 `getEntitiesOfClass` 为批量缓存
+
+### 8.9 AtomicBombBlockEntity `setChanged()` 频率
+- 只在 `fuseTicks % 10 == 0 || fuseTicks <= 5` 时调用
+
+## 9. 后续建议
+
+1. `RadiationZone.shelterFactor(...)` — 可做遮挡缓存或更粗糙的遮蔽近似
+2. `processDeferredEdits(...)` — 可升级为按 chunk 分桶唤醒
+3. crater/shock 的对象分配量 — 可考虑对象池或批量结构压缩
+4. 更激进的地形改写 — 更高前期预算、更低保真 crater、甚至 chunk/section 级批量更新
