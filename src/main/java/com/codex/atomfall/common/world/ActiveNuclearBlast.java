@@ -1081,8 +1081,10 @@ public final class ActiveNuclearBlast {
         int maxX = minX + 15;
         int maxZ = minZ + 15;
         if (!this.shockChunkColumnReady) {
-            this.shockChunkBlockX = alignToGrid(minX, step, this.origin.getX());
-            this.shockChunkBlockStartZ = alignToGrid(minZ, step, this.origin.getZ());
+            int phaseX = shockGridPhase(chunkX, chunkZ, this.shockChunkRingStart, step, 181);
+            int phaseZ = shockGridPhase(chunkX, chunkZ, this.shockChunkRingStart, step, 239);
+            this.shockChunkBlockX = alignToGrid(minX, step, this.origin.getX() + phaseX);
+            this.shockChunkBlockStartZ = alignToGrid(minZ, step, this.origin.getZ() + phaseZ);
             this.shockChunkBlockZ = this.shockChunkBlockStartZ;
             this.shockChunkColumnReady = true;
         }
@@ -1096,7 +1098,9 @@ public final class ActiveNuclearBlast {
             while (this.shockChunkBlockZ <= maxZ && stats.canContinue()) {
                 stats.scansRemaining--;
                 stats.sampledColumns++;
-                processShockChunkColumn(level, targets, stats, this.shockChunkBlockX, this.shockChunkBlockZ, chunkLoaded);
+                int sampleX = jitterShockSample(this.shockChunkBlockX, this.shockChunkBlockZ, step, minX, maxX, 311);
+                int sampleZ = jitterShockSample(this.shockChunkBlockZ, this.shockChunkBlockX, step, minZ, maxZ, 353);
+                processShockChunkColumn(level, targets, stats, sampleX, sampleZ, step, minX, maxX, minZ, maxZ, chunkLoaded);
                 this.shockChunkBlockZ += step;
             }
             if (this.shockChunkBlockZ > maxZ) {
@@ -1112,7 +1116,8 @@ public final class ActiveNuclearBlast {
         return false;
     }
 
-    private void processShockChunkColumn(ServerLevel level, List<ShockTarget> targets, ShockSamplingStats stats, int x, int z, boolean chunkLoaded) {
+    private void processShockChunkColumn(ServerLevel level, List<ShockTarget> targets, ShockSamplingStats stats,
+                                         int x, int z, int step, int minX, int maxX, int minZ, int maxZ, boolean chunkLoaded) {
         double dx = x + 0.5D - this.center.x;
         double dz = z + 0.5D - this.center.z;
         double distance = Math.sqrt(dx * dx + dz * dz);
@@ -1143,11 +1148,7 @@ public final class ActiveNuclearBlast {
             return;
         }
 
-        int cost = queueShockTarget(targets, x, z, radial, psi, angle);
-        if (cost > 0) {
-            stats.queuedTargets += cost;
-            stats.budget -= cost;
-        }
+        queueShockFootprint(targets, stats, x, z, radial, psi, angle, step, minX, maxX, minZ, maxZ);
     }
 
     private void advanceShockChunkCursor() {
@@ -1171,13 +1172,64 @@ public final class ActiveNuclearBlast {
         stats.completedRings++;
     }
 
-    private int queueShockTarget(List<ShockTarget> targets, int x, int z, int radial, double psi, double angle) {
+    private void queueShockFootprint(List<ShockTarget> targets, ShockSamplingStats stats, int x, int z, int radial, double psi, double angle,
+                                     int step, int minX, int maxX, int minZ, int maxZ) {
+        int cost = queueShockTarget(targets, x, z, radial, psi, angle, true);
+        if (cost > 0) {
+            stats.queuedTargets += cost;
+            stats.budget -= cost;
+        }
+        if (stats.budget <= 0) {
+            return;
+        }
+
+        int radius = shockFootprintRadius(psi, radial, step);
+        if (radius <= 0) {
+            return;
+        }
+
+        double dirX = Math.cos(angle);
+        double dirZ = Math.sin(angle);
+        for (int ox = -radius; ox <= radius && stats.budget > 0; ox++) {
+            for (int oz = -radius; oz <= radius && stats.budget > 0; oz++) {
+                if (ox == 0 && oz == 0) {
+                    continue;
+                }
+                double along = ox * dirX + oz * dirZ;
+                double across = -ox * dirZ + oz * dirX;
+                double alongRadius = radius + 0.75D;
+                double acrossRadius = radius * 0.72D + 0.65D;
+                double ellipse = along * along / (alongRadius * alongRadius)
+                        + across * across / (acrossRadius * acrossRadius);
+                double edgeNoise = shockValueNoise((x + ox) * 0.37D, (z + oz) * 0.37D, 431);
+                if (ellipse > 0.96D + edgeNoise * 0.26D) {
+                    continue;
+                }
+
+                int nx = x + ox;
+                int nz = z + oz;
+                if (nx < minX || nx > maxX || nz < minZ || nz > maxZ) {
+                    continue;
+                }
+                double offsetDistance = Math.sqrt(ox * (double) ox + oz * (double) oz);
+                double falloff = 1.0D - Mth.clamp(offsetDistance / (radius + 1.15D), 0.0D, 1.0D);
+                double offsetPsi = psi * Mth.clamp(0.62D + falloff * 0.25D + edgeNoise * 0.13D, 0.54D, 0.94D);
+                int brushCost = queueShockTarget(targets, nx, nz, radial, offsetPsi, angle, false);
+                if (brushCost > 0) {
+                    stats.queuedTargets += brushCost;
+                    stats.budget -= brushCost;
+                }
+            }
+        }
+    }
+
+    private int queueShockTarget(List<ShockTarget> targets, int x, int z, int radial, double psi, double angle, boolean includeStructural) {
         long surfKey = BlockPos.asLong(x, 0, z);
         long structKey = BlockPos.asLong(x, 1, z);
         double prevSurfacePsi = this.processedSurfaceColumns.getOrDefault(surfKey, -1.0D);
         double prevStructPsi = this.processedStructureColumns.getOrDefault(structKey, -1.0D);
         boolean needsSurface = psi > prevSurfacePsi + 1.5D;
-        boolean needsStructural = psi > prevStructPsi + 1.5D;
+        boolean needsStructural = includeStructural && psi > prevStructPsi + 1.5D;
         if (!needsSurface && !needsStructural) {
             return 0;
         }
@@ -2036,6 +2088,37 @@ public final class ActiveNuclearBlast {
         return min + Math.floorMod(anchor - min, step);
     }
 
+    private static int shockGridPhase(int chunkX, int chunkZ, int ringStart, int step, int salt) {
+        if (step <= 1) {
+            return 0;
+        }
+        return shockSurfaceHash(chunkX, ringStart, chunkZ, salt) % step;
+    }
+
+    private static int jitterShockSample(int primary, int secondary, int step, int min, int max, int salt) {
+        if (step <= 2) {
+            return primary;
+        }
+        int range = Math.max(1, step / 2);
+        int jitter = shockSurfaceHash(primary, secondary, salt, 997) % (range * 2 + 1) - range;
+        return Mth.clamp(primary + jitter, min, max);
+    }
+
+    private int shockFootprintRadius(double psi, int radial, int step) {
+        if (step <= 1 || psi < 0.75D) {
+            return 0;
+        }
+
+        int radius = Math.max(1, step / 2);
+        if (psi >= 8.0D && radial <= this.geometry.shockSevereRadius()) {
+            radius++;
+        }
+        if (radial > this.geometry.shockSevereRadius() && psi < 3.0D) {
+            radius = Math.min(radius, 1);
+        }
+        return Math.min(radius, 3);
+    }
+
     private int shockChunkColumnStep(double radius) {
         int stride = shellStride(radius);
         if (radius <= 220.0D) {
@@ -2044,7 +2127,7 @@ public final class ActiveNuclearBlast {
         if (radius <= 700.0D) {
             return Math.max(2, stride / 3);
         }
-        return Math.max(3, stride / 3);
+        return Math.max(2, stride / 4);
     }
 
     private int shellStride(double radius) {
@@ -2084,27 +2167,22 @@ public final class ActiveNuclearBlast {
             return;
         }
 
-        AtomfallMod.LOGGER.info(
-                "Atomfall shock perf age={} front={}/{} sample={}/{} ring={}..{} rings={} chunks={}/{} columns={} targets={} deferredTargets={} editQueue={} batches={} ready={} deferredEdits={} scanLeft={} budgetLeft={}",
-                this.ageTicks,
-                Mth.floor(this.previousAverageFront),
-                Mth.floor(this.averageFront),
-                Mth.floor(minShockSampleFront()),
-                Mth.floor(maxShockFront()),
-                this.shockChunkRingStart,
-                this.shockChunkRingEnd,
-                stats.completedRings,
-                stats.chunksVisited,
-                stats.chunksSkipped,
-                stats.sampledColumns,
-                pendingTargets,
-                stats.deferredTargets,
-                this.shockEditQueue.size(),
-                this.pendingShockBatches.size(),
-                readyShockTargetCount(),
-                this.deferredEdits.size(),
-                stats.scansRemaining,
-                stats.budget
+        ShockPerformanceLog.append(
+                "Atomfall shock perf age=" + this.ageTicks
+                        + " front=" + Mth.floor(this.previousAverageFront) + "/" + Mth.floor(this.averageFront)
+                        + " sample=" + Mth.floor(minShockSampleFront()) + "/" + Mth.floor(maxShockFront())
+                        + " ring=" + this.shockChunkRingStart + ".." + this.shockChunkRingEnd
+                        + " rings=" + stats.completedRings
+                        + " chunks=" + stats.chunksVisited + "/" + stats.chunksSkipped
+                        + " columns=" + stats.sampledColumns
+                        + " targets=" + pendingTargets
+                        + " deferredTargets=" + stats.deferredTargets
+                        + " editQueue=" + this.shockEditQueue.size()
+                        + " batches=" + this.pendingShockBatches.size()
+                        + " ready=" + readyShockTargetCount()
+                        + " deferredEdits=" + this.deferredEdits.size()
+                        + " scanLeft=" + stats.scansRemaining
+                        + " budgetLeft=" + stats.budget
         );
     }
 

@@ -3,6 +3,7 @@ package com.codex.atomfall;
 import com.codex.atomfall.common.temperature.TemperatureSavedData;
 import com.codex.atomfall.common.temperature.TemperatureZone;
 import com.codex.atomfall.common.world.BlastPhysicsConstants;
+import com.codex.atomfall.common.world.ShockPerformanceLog;
 import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
@@ -111,7 +112,8 @@ public final class AtomfallCommands {
                 () -> Component.literal("Atomfall shock perf log: "
                         + (BlastPhysicsConstants.shockPerfLogEnabled() ? "on" : "off")
                         + " | interval=" + BlastPhysicsConstants.shockPerfLogIntervalTicks()
-                        + " ticks | use /atomfall performance log on, off, or interval <ticks>"),
+                        + " ticks | file=" + ShockPerformanceLog.path()
+                        + " | use /atomfall performance log on, off, or interval <ticks>"),
                 false
         );
         return 1;
@@ -121,7 +123,7 @@ public final class AtomfallCommands {
         BlastPhysicsConstants.setShockPerfLogEnabled(true);
         context.getSource().sendSuccess(
                 () -> Component.literal("Atomfall shock perf log enabled. Active blasts will write Atomfall shock perf lines every "
-                        + BlastPhysicsConstants.shockPerfLogIntervalTicks() + " ticks."),
+                        + BlastPhysicsConstants.shockPerfLogIntervalTicks() + " ticks to " + ShockPerformanceLog.path() + "."),
                 true
         );
         return 1;

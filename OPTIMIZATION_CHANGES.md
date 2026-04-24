@@ -22,12 +22,14 @@
 - Replaced sector/radial/lateral shell sampling with radius-ring -> chunk -> chunk-local grid traversal.
 - Ring processing is resumable across ticks with `shockChunkRing*` cursors and remains governed by `shockBlockBudget`.
 - Chunk-ring traversal improves cache locality and avoids dropping unsampled shell slices when the budget is exhausted.
+- Chunk-local sampling now uses per-chunk/ring phase offsets, deterministic jitter, and a surface-only footprint brush to avoid visible checkerboard damage patterns.
 
 ### 10.5 Debug log command
 - Added `/atomfall performance log` to show shock performance-log status.
 - Added `/atomfall performance log on` and `/atomfall performance log off` to control log generation.
 - Added `/atomfall performance log interval <ticks>` to tune the server-log interval.
 - Shock logs are off by default and, when enabled, emit `Atomfall shock perf` lines with front/sample radius, ring range, chunks, sampled columns, queued targets, deferred targets, and queue backlogs.
+- Shock performance logs are written to a dedicated `logs/atomfall-shock-perf.log` file under the current Minecraft game directory.
 
 ### 10.6 Profile tuning
 - Updated shock performance defaults: `HIGH_FIDELITY` now uses 96 sectors and a 1600 shock budget; `BALANCED` uses 48 sectors and 1200 budget; `PERFORMANCE` uses 36 sectors and 1000 budget.
