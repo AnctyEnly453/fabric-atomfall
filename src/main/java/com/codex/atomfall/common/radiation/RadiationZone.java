@@ -6,13 +6,13 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.particles.ParticleTypes;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.Mth;
-import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.block.state.BlockState;
-import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
-import net.minecraft.world.phys.shapes.CollisionContext;
 
 public final class RadiationZone {
+    private static final double SHELTER_SAMPLE_STEP = 1.25D;
+    private static final double CHUNK_EXIT_EPSILON = 0.05D;
+
     private final BlockPos center;
     private final double promptRadius;
     private final double falloutRadius;
@@ -100,18 +100,48 @@ public final class RadiationZone {
             return 1.0D;
         }
 
-        Vec3 step = delta.normalize().scale(1.25D);
-        Vec3 current = origin;
+        Vec3 direction = delta.scale(1.0D / distance);
         double factor = 1.0D;
-        for (double walked = 0.0D; walked < distance; walked += 1.25D) {
-            BlockState state = level.getBlockState(BlockPos.containing(current));
+        for (double walked = 0.0D; walked < distance; ) {
+            Vec3 current = origin.add(direction.scale(walked));
+            BlockPos pos = BlockPos.containing(current);
+            if (!level.hasChunk(pos.getX() >> 4, pos.getZ() >> 4)) {
+                walked += distanceToChunkExit(current, direction);
+                continue;
+            }
+
+            BlockState state = level.getBlockState(pos);
             factor *= RadiationMaterialRules.transmission(state);
             if (factor <= 0.05D) {
                 return 0.05D;
             }
-            current = current.add(step);
+            walked += SHELTER_SAMPLE_STEP;
         }
 
         return Math.max(0.05D, factor);
+    }
+
+    private static double distanceToChunkExit(Vec3 current, Vec3 direction) {
+        double exit = Double.POSITIVE_INFINITY;
+        if (Math.abs(direction.x) > 1.0E-6D) {
+            int chunkX = Mth.floor(current.x) >> 4;
+            double boundaryX = direction.x > 0.0D ? (chunkX + 1) * 16.0D : chunkX * 16.0D;
+            double xDistance = (boundaryX - current.x) / direction.x;
+            if (xDistance > CHUNK_EXIT_EPSILON) {
+                exit = Math.min(exit, xDistance);
+            }
+        }
+        if (Math.abs(direction.z) > 1.0E-6D) {
+            int chunkZ = Mth.floor(current.z) >> 4;
+            double boundaryZ = direction.z > 0.0D ? (chunkZ + 1) * 16.0D : chunkZ * 16.0D;
+            double zDistance = (boundaryZ - current.z) / direction.z;
+            if (zDistance > CHUNK_EXIT_EPSILON) {
+                exit = Math.min(exit, zDistance);
+            }
+        }
+        if (!Double.isFinite(exit)) {
+            return SHELTER_SAMPLE_STEP;
+        }
+        return Math.max(SHELTER_SAMPLE_STEP, exit + CHUNK_EXIT_EPSILON);
     }
 }

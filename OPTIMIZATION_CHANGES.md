@@ -12,6 +12,7 @@
 - Loaded columns are marked in `processedSurfaceColumns` / `processedStructureColumns` as soon as they are queued, preventing repeated async batches from spending budget on the same column.
 - Ready shock side effects now keep unprocessed targets when the tick budget runs out instead of clearing the whole queue.
 - Async structure snapshots now use `WORLD_SURFACE` so leaves, trees, and exposed structures are included consistently.
+- The safety timeout now waits for sampling, async batches, ready side effects, deferred edits, and shock edits to drain instead of dropping unfinished shockwave work.
 
 ### 10.3 Stronger scoured-surface visuals
 - Surface shock edits now remove top layers and leave a scoured floor made from coarse dirt, gravel, cobblestone, tuff, scorched earth, and related materials.
@@ -23,6 +24,9 @@
 - Ring processing is resumable across ticks with `shockChunkRing*` cursors and remains governed by `shockBlockBudget`.
 - Chunk-ring traversal improves cache locality and avoids dropping unsampled shell slices when the budget is exhausted.
 - Chunk-local sampling now uses per-chunk/ring phase offsets, deterministic jitter, and a surface-only footprint brush to avoid visible checkerboard damage patterns.
+- Footprint brush targets are now surface-visual-only: only the center sample enters the water/ignition/margin side-effect queue, preventing the brush from multiplying ready targets.
+- Shock `BlockEdit` work is de-duplicated by block position before application, so overlapping footprint samples replace older queued edits instead of growing the queue indefinitely.
+- Shock edit application now scales up when the backlog is very large, helping drained queues catch up after heavy async batches.
 
 ### 10.5 Debug log command
 - Added `/atomfall performance log` to show shock performance-log status.
@@ -30,8 +34,20 @@
 - Added `/atomfall performance log interval <ticks>` to tune the server-log interval.
 - Shock logs are off by default and, when enabled, emit `Atomfall shock perf` lines with front/sample radius, ring range, chunks, sampled columns, queued targets, deferred targets, and queue backlogs.
 - Shock performance logs are written to a dedicated `logs/atomfall-shock-perf.log` file under the current Minecraft game directory.
+- Expanded shock performance lines with tick/phase timings, sample lag, crater/shock apply counts, edit dedupe counts, async batch completions, ready side-effect work, deferred scan/apply/trim counts, and item entity counts inside the blast area.
+- Deferred shock work is now bucketed by chunk in memory while preserving exact per-column `PendingEdit` data in persistence.
+- Deferred processing now skips unloaded chunks by bucket instead of repeatedly scanning every unloaded column, and logs `deferredBuckets=total/loaded/scanned/unloaded`.
 
-### 10.6 Profile tuning
+### 10.6 Drop suppression
+- `ActiveNuclearBlast` now uses `BlastWorldMutations.NO_DROP_FLAGS` for direct crater, shock, collapse, and ignition block writes.
+- This keeps blast-driven block replacement client-visible while suppressing item drops from destroyed grass, leaves, crops, loose blocks, and similar states.
+
+### 10.7 Radiation sampling
+- `RadiationZone.shelterFactor` now checks chunk availability before reading blocks along the shelter ray.
+- Unloaded chunks are skipped by chunk span instead of sampled block-by-block, preventing long-distance radiation checks from forcing synchronous `getChunkBlocking` loads.
+- Loaded chunks still use the existing 1.25-block shelter sampling step, preserving exact shielding where terrain is available.
+
+### 10.8 Profile tuning
 - Updated shock performance defaults: `HIGH_FIDELITY` now uses 96 sectors and a 1600 shock budget; `BALANCED` uses 48 sectors and 1200 budget; `PERFORMANCE` uses 36 sectors and 1000 budget.
 - Mid-range lateral sampling is enabled in the default profile so the visible destruction band is more continuous.
 

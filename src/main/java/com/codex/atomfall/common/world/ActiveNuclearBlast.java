@@ -19,6 +19,7 @@ import net.minecraft.util.Mth;
 import net.minecraft.world.effect.MobEffectInstance;
 import net.minecraft.world.effect.MobEffects;
 import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.block.BaseFireBlock;
 import net.minecraft.world.level.block.Blocks;
@@ -30,12 +31,15 @@ import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.CollisionContext;
 
+import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.longs.LongArrayList;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -55,7 +59,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public final class ActiveNuclearBlast {
     private static final Direction[] HORIZONTAL = {Direction.NORTH, Direction.SOUTH, Direction.WEST, Direction.EAST};
-    private static final int UPDATE_CLIENTS_ONLY = 2;
+    private static final int BLAST_BLOCK_UPDATE_FLAGS = BlastWorldMutations.NO_DROP_FLAGS;
     private static final int PARALLEL_MIN_SNAPSHOTS = 120;
     private static final int CRATER_COLLAPSE_MAX_PASSES = 8;
     private static final ExecutorService COMPUTE_EXECUTOR = createComputeExecutor();
@@ -70,9 +74,13 @@ public final class ActiveNuclearBlast {
     private final float[] sectorEnergy;
     private final it.unimi.dsi.fastutil.longs.Long2DoubleOpenHashMap processedSurfaceColumns = new it.unimi.dsi.fastutil.longs.Long2DoubleOpenHashMap();
     private final it.unimi.dsi.fastutil.longs.Long2DoubleOpenHashMap processedStructureColumns = new it.unimi.dsi.fastutil.longs.Long2DoubleOpenHashMap();
-    private final LongOpenHashSet deferredColumns = new LongOpenHashSet();
+    private final LongOpenHashSet deferredEditKeys = new LongOpenHashSet();
+    private final Long2ObjectOpenHashMap<ArrayList<PendingEdit>> deferredEditsByChunk = new Long2ObjectOpenHashMap<>();
+    private final LongArrayList deferredChunkOrder = new LongArrayList();
     private final Set<UUID> heardShockPlayers = new HashSet<>();
-    private final java.util.ArrayList<PendingEdit> deferredEdits = new java.util.ArrayList<>();
+    private final PerfCounters perf = new PerfCounters();
+    private int deferredEditCount;
+    private int deferredChunkCursor;
 
     private boolean flashApplied;
     private boolean craterFinished;
@@ -140,6 +148,70 @@ public final class ActiveNuclearBlast {
         }
     }
 
+    private static final class PerfCounters {
+        ShockSamplingStats samplingStats;
+        int samplingTargets;
+        int craterApplied;
+        int craterScanned;
+        int craterBatchEdits;
+        int craterCollapseRemoved;
+        int shockApplyBudget;
+        int shockApplied;
+        int shockScanned;
+        int shockIncomingEdits;
+        int shockQueuedEdits;
+        int shockReplacedEdits;
+        int shockCompletedBatches;
+        int shockBatchSideEffects;
+        int readyProcessed;
+        int readySpent;
+        int deferredBudget;
+        int deferredScanned;
+        int deferredApplied;
+        int deferredUnloaded;
+        int deferredTrimmed;
+        int deferredBucketScanned;
+        int deferredLoadedBuckets;
+        int deferredUnloadedBuckets;
+        long tickStartNanos;
+        long craterNanos;
+        long shockNanos;
+        long entityNanos;
+        long deferredNanos;
+
+        void reset() {
+            this.samplingStats = null;
+            this.samplingTargets = 0;
+            this.craterApplied = 0;
+            this.craterScanned = 0;
+            this.craterBatchEdits = 0;
+            this.craterCollapseRemoved = 0;
+            this.shockApplyBudget = 0;
+            this.shockApplied = 0;
+            this.shockScanned = 0;
+            this.shockIncomingEdits = 0;
+            this.shockQueuedEdits = 0;
+            this.shockReplacedEdits = 0;
+            this.shockCompletedBatches = 0;
+            this.shockBatchSideEffects = 0;
+            this.readyProcessed = 0;
+            this.readySpent = 0;
+            this.deferredBudget = 0;
+            this.deferredScanned = 0;
+            this.deferredApplied = 0;
+            this.deferredUnloaded = 0;
+            this.deferredTrimmed = 0;
+            this.deferredBucketScanned = 0;
+            this.deferredLoadedBuckets = 0;
+            this.deferredUnloadedBuckets = 0;
+            this.tickStartNanos = System.nanoTime();
+            this.craterNanos = 0L;
+            this.shockNanos = 0L;
+            this.entityNanos = 0L;
+            this.deferredNanos = 0L;
+        }
+    }
+
     private record BlockEdit(long packedPos, BlockState newState, boolean remove) {
         boolean apply(ServerLevel level, BlockPos.MutableBlockPos mutable) {
             mutable.set(BlockPos.getX(this.packedPos), BlockPos.getY(this.packedPos), BlockPos.getZ(this.packedPos));
@@ -151,13 +223,13 @@ public final class ActiveNuclearBlast {
                 if (current.isAir()) {
                     return false;
                 }
-                level.setBlock(mutable, Blocks.AIR.defaultBlockState(), UPDATE_CLIENTS_ONLY);
+                level.setBlock(mutable, Blocks.AIR.defaultBlockState(), BLAST_BLOCK_UPDATE_FLAGS);
                 return true;
             } else {
                 if (current == this.newState) {
                     return false;
                 }
-                level.setBlock(mutable, this.newState, UPDATE_CLIENTS_ONLY);
+                level.setBlock(mutable, this.newState, BLAST_BLOCK_UPDATE_FLAGS);
                 return true;
             }
         }
@@ -174,8 +246,9 @@ public final class ActiveNuclearBlast {
     private final ArrayList<BlockEdit> craterEditQueue = new ArrayList<>();
     private boolean craterEditsPrepared;
     private final ArrayList<BlockEdit> shockEditQueue = new ArrayList<>();
+    private final it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap queuedShockEditIndexes = new it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap();
 
-    private record ShockTarget(int x, int z, int radial, double psi, double angle, boolean needsSurface, boolean needsStructural) {
+    private record ShockTarget(int x, int z, int radial, double psi, double angle, boolean needsSurface, boolean needsStructural, boolean sideEffects) {
         private static final Codec<ShockTarget> CODEC = RecordCodecBuilder.create(instance ->
                 instance.group(
                         Codec.INT.fieldOf("x").forGetter(ShockTarget::x),
@@ -184,7 +257,8 @@ public final class ActiveNuclearBlast {
                         Codec.DOUBLE.fieldOf("psi").forGetter(ShockTarget::psi),
                         Codec.DOUBLE.fieldOf("angle").forGetter(ShockTarget::angle),
                         Codec.BOOL.fieldOf("needs_surface").forGetter(ShockTarget::needsSurface),
-                        Codec.BOOL.fieldOf("needs_structural").forGetter(ShockTarget::needsStructural)
+                        Codec.BOOL.fieldOf("needs_structural").forGetter(ShockTarget::needsStructural),
+                        Codec.BOOL.optionalFieldOf("side_effects", true).forGetter(ShockTarget::sideEffects)
                 ).apply(instance, ShockTarget::new)
         );
     }
@@ -382,6 +456,7 @@ public final class ActiveNuclearBlast {
         this.sectorEnergy = sectorEnergy;
         this.averageFront = geometry.fireballRadius();
         this.previousAverageFront = this.averageFront;
+        this.queuedShockEditIndexes.defaultReturnValue(-1);
         int craterRadius = Mth.ceil(geometry.craterRadius());
         this.craterCursorX = -craterRadius;
         this.craterCursorZ = -craterRadius;
@@ -405,7 +480,7 @@ public final class ActiveNuclearBlast {
                         toColumnPsiList(this.processedStructureColumns)
                 ),
                 new WorkState(
-                        new ArrayList<>(this.deferredEdits),
+                        collectDeferredEdits(),
                         collectPendingShockTargets(),
                         collectReadyShockTargets(),
                         toBlockEditStates(this.craterEditQueue),
@@ -463,12 +538,13 @@ public final class ActiveNuclearBlast {
             blast.craterEditQueue.add(fromBlockEditState(editState));
         }
         for (BlockEditState editState : state.workState().shockEdits()) {
-            blast.shockEditQueue.add(fromBlockEditState(editState));
+            blast.queueShockEdit(fromBlockEditState(editState));
         }
         return blast;
     }
 
     public boolean tick(ServerLevel level) {
+        this.perf.reset();
         this.ageTicks++;
         if (!this.flashApplied) {
             this.flashApplied = true;
@@ -476,29 +552,36 @@ public final class ActiveNuclearBlast {
         }
 
         int craterRadius = Mth.ceil(this.geometry.craterRadius());
+        long phaseStart = System.nanoTime();
         if (!this.craterFinished) {
             processCrater(level);
         }
         if (this.craterFinished && !this.craterCollapsed) {
             processCraterCollapse(level, craterRadius);
         }
+        this.perf.craterNanos += System.nanoTime() - phaseStart;
 
         advanceShockwave(level);
+        phaseStart = System.nanoTime();
         processShockwaveShell(level);
+        this.perf.shockNanos += System.nanoTime() - phaseStart;
         if (this.ageTicks % 5 == 0) {
+            phaseStart = System.nanoTime();
             damageEntities(level);
+            this.perf.entityNanos += System.nanoTime() - phaseStart;
         }
         emitShellParticles(level);
+        phaseStart = System.nanoTime();
         processDeferredEdits(level);
+        this.perf.deferredNanos += System.nanoTime() - phaseStart;
+        logShockPerformance(level);
 
         if (this.craterFinished && this.craterCollapsed && allSectorsMaxed() && allShockSectorsSampled()
-                && this.ageTicks > 20 && this.deferredEdits.isEmpty() && this.pendingShockBatches.isEmpty()
-                && this.readyShockTargets.isEmpty() && this.shockEditQueue.isEmpty()) {
+                && this.ageTicks > 20 && allShockQueuesDrained()) {
             return true;
         }
         int maxTicks = Mth.ceil(this.geometry.shockSurfaceRadius() / BlastPhysicsConstants.SOUND_SPEED_BLOCKS_PER_TICK) + 800;
-        if (this.ageTicks > maxTicks) {
-            this.deferredEdits.clear();
+        if (this.ageTicks > maxTicks && allSectorsMaxed() && allShockSectorsSampled() && allShockQueuesDrained()) {
             return true;
         }
         return false;
@@ -563,6 +646,8 @@ public final class ActiveNuclearBlast {
             }
             scanned++;
         }
+        this.perf.craterApplied += applied;
+        this.perf.craterScanned += scanned;
 
         this.craterFinished = this.craterEditsPrepared && this.craterComputeFuture == null && this.craterEditQueue.isEmpty();
     }
@@ -602,7 +687,7 @@ public final class ActiveNuclearBlast {
                         }
                         BlockState below = level.getBlockState(pos.set(worldX, y - 1, worldZ));
                         if (below.isAir()) {
-                            level.setBlock(pos.set(worldX, y, worldZ), Blocks.AIR.defaultBlockState(), UPDATE_CLIENTS_ONLY);
+                            level.setBlock(pos.set(worldX, y, worldZ), Blocks.AIR.defaultBlockState(), BLAST_BLOCK_UPDATE_FLAGS);
                             budget--;
                             changed = true;
                         }
@@ -652,8 +737,9 @@ public final class ActiveNuclearBlast {
             if (!state.isAir() && !state.is(Blocks.BEDROCK) && !state.hasBlockEntity()) {
                 BlockState below = level.getBlockState(pos.set(worldX, this.craterCollapseY - 1, worldZ));
                 if (below.isAir()) {
-                    level.setBlock(pos.set(worldX, this.craterCollapseY, worldZ), Blocks.AIR.defaultBlockState(), UPDATE_CLIENTS_ONLY);
+                    level.setBlock(pos.set(worldX, this.craterCollapseY, worldZ), Blocks.AIR.defaultBlockState(), BLAST_BLOCK_UPDATE_FLAGS);
                     budget--;
+                    this.perf.craterCollapseRemoved++;
                     this.craterCollapsePassChanged = true;
                 }
             }
@@ -905,7 +991,8 @@ public final class ActiveNuclearBlast {
             }
         }
 
-        logShockSampling(stats, targets.size());
+        this.perf.samplingStats = stats;
+        this.perf.samplingTargets = targets.size();
 
         if (targets.isEmpty()) {
             return;
@@ -1138,12 +1225,10 @@ public final class ActiveNuclearBlast {
 
         int radial = Mth.floor(distance);
         if (!chunkLoaded) {
-            long key = BlockPos.asLong(x, 0, z);
-            if (this.deferredColumns.add(key)) {
-                deferredEdits.add(new PendingEdit(x, z, radial, psi, angle, false));
-                deferredEdits.add(new PendingEdit(x, z, radial, psi, angle, true));
-                stats.deferredTargets += 2;
-                stats.budget -= 2;
+            int deferred = queueDeferredColumn(x, z, radial, psi, angle, false);
+            if (deferred > 0) {
+                stats.deferredTargets += deferred;
+                stats.budget -= deferred;
             }
             return;
         }
@@ -1174,7 +1259,7 @@ public final class ActiveNuclearBlast {
 
     private void queueShockFootprint(List<ShockTarget> targets, ShockSamplingStats stats, int x, int z, int radial, double psi, double angle,
                                      int step, int minX, int maxX, int minZ, int maxZ) {
-        int cost = queueShockTarget(targets, x, z, radial, psi, angle, true);
+        int cost = queueShockTarget(targets, x, z, radial, psi, angle, true, true);
         if (cost > 0) {
             stats.queuedTargets += cost;
             stats.budget -= cost;
@@ -1214,7 +1299,7 @@ public final class ActiveNuclearBlast {
                 double offsetDistance = Math.sqrt(ox * (double) ox + oz * (double) oz);
                 double falloff = 1.0D - Mth.clamp(offsetDistance / (radius + 1.15D), 0.0D, 1.0D);
                 double offsetPsi = psi * Mth.clamp(0.62D + falloff * 0.25D + edgeNoise * 0.13D, 0.54D, 0.94D);
-                int brushCost = queueShockTarget(targets, nx, nz, radial, offsetPsi, angle, false);
+                int brushCost = queueShockTarget(targets, nx, nz, radial, offsetPsi, angle, false, false);
                 if (brushCost > 0) {
                     stats.queuedTargets += brushCost;
                     stats.budget -= brushCost;
@@ -1223,7 +1308,8 @@ public final class ActiveNuclearBlast {
         }
     }
 
-    private int queueShockTarget(List<ShockTarget> targets, int x, int z, int radial, double psi, double angle, boolean includeStructural) {
+    private int queueShockTarget(List<ShockTarget> targets, int x, int z, int radial, double psi, double angle,
+                                 boolean includeStructural, boolean sideEffects) {
         long surfKey = BlockPos.asLong(x, 0, z);
         long structKey = BlockPos.asLong(x, 1, z);
         double prevSurfacePsi = this.processedSurfaceColumns.getOrDefault(surfKey, -1.0D);
@@ -1240,23 +1326,47 @@ public final class ActiveNuclearBlast {
         if (needsStructural) {
             this.processedStructureColumns.put(structKey, psi);
         }
-        targets.add(new ShockTarget(x, z, radial, psi, angle, needsSurface, needsStructural));
+        targets.add(new ShockTarget(x, z, radial, psi, angle, needsSurface, needsStructural, sideEffects));
         return (needsSurface ? 1 : 0) + (needsStructural ? 1 : 0);
     }
 
     private void applyShockEdits(ServerLevel level) {
-        int budget = BlastPhysicsConstants.shockBlockBudget();
+        int budget = shockApplyBudget();
+        this.perf.shockApplyBudget = budget;
         int maxScans = budget * 4;
         BlockPos.MutableBlockPos mutable = new BlockPos.MutableBlockPos();
         int applied = 0;
         int scanned = 0;
         while (applied < budget && scanned < maxScans && !this.shockEditQueue.isEmpty()) {
             BlockEdit edit = this.shockEditQueue.remove(this.shockEditQueue.size() - 1);
+            this.queuedShockEditIndexes.remove(edit.packedPos());
             if (edit.apply(level, mutable)) {
                 applied++;
             }
             scanned++;
         }
+        this.perf.shockApplied += applied;
+        this.perf.shockScanned += scanned;
+    }
+
+    private void queueShockEdits(List<BlockEdit> edits) {
+        this.perf.shockIncomingEdits += edits.size();
+        for (BlockEdit edit : edits) {
+            queueShockEdit(edit);
+        }
+    }
+
+    private void queueShockEdit(BlockEdit edit) {
+        int index = this.queuedShockEditIndexes.get(edit.packedPos());
+        if (index >= 0 && index < this.shockEditQueue.size()
+                && this.shockEditQueue.get(index).packedPos() == edit.packedPos()) {
+            this.shockEditQueue.set(index, edit);
+            this.perf.shockReplacedEdits++;
+            return;
+        }
+        this.queuedShockEditIndexes.put(edit.packedPos(), this.shockEditQueue.size());
+        this.shockEditQueue.add(edit);
+        this.perf.shockQueuedEdits++;
     }
 
     private int processSurfaceColumn(ServerLevel level, int x, int z, int radial, double psi) {
@@ -1334,22 +1444,22 @@ public final class ActiveNuclearBlast {
             if (reflectedSurfacePsi >= threshold) {
                 if ((BlastMaterialRules.isLooseSurface(neighbor) || BlastMaterialRules.isScorchable(neighbor) || isRockySurface(neighbor))
                         && reflectedSurfacePsi < threshold * 1.85D) {
-                    level.setBlock(pos, shockScouredFloorState(neighbor, nx, ny, nz, radial, psi), UPDATE_CLIENTS_ONLY);
+                    level.setBlock(pos, shockScouredFloorState(neighbor, nx, ny, nz, radial, psi), BLAST_BLOCK_UPDATE_FLAGS);
                 } else {
-                    level.setBlock(pos, Blocks.AIR.defaultBlockState(), UPDATE_CLIENTS_ONLY);
+                    level.setBlock(pos, Blocks.AIR.defaultBlockState(), BLAST_BLOCK_UPDATE_FLAGS);
                 }
                 edits++;
                 continue;
             }
 
             if (BlastMaterialRules.isScorchable(neighbor) && reflectedSurfacePsi >= threshold * 0.7D) {
-                level.setBlock(pos, shockScouredFloorState(neighbor, nx, ny, nz, radial, psi), UPDATE_CLIENTS_ONLY);
+                level.setBlock(pos, shockScouredFloorState(neighbor, nx, ny, nz, radial, psi), BLAST_BLOCK_UPDATE_FLAGS);
                 edits++;
                 continue;
             }
 
             if (BlastMaterialRules.isVitrifiable(neighbor) && radial <= this.geometry.vitrificationRadius() * 1.35D && reflectedSurfacePsi >= threshold * 0.8D) {
-                level.setBlock(pos, ModBlocks.FUSED_GLASS.get().defaultBlockState(), UPDATE_CLIENTS_ONLY);
+                level.setBlock(pos, ModBlocks.FUSED_GLASS.get().defaultBlockState(), BLAST_BLOCK_UPDATE_FLAGS);
                 edits++;
             }
         }
@@ -1398,9 +1508,9 @@ public final class ActiveNuclearBlast {
             }
 
             if (state.getFluidState().is(FluidTags.WATER)) {
-                level.setBlock(pos, Blocks.AIR.defaultBlockState(), UPDATE_CLIENTS_ONLY);
+                level.setBlock(pos, Blocks.AIR.defaultBlockState(), BLAST_BLOCK_UPDATE_FLAGS);
             } else {
-                level.setBlock(pos, Blocks.AIR.defaultBlockState(), UPDATE_CLIENTS_ONLY);
+                level.setBlock(pos, Blocks.AIR.defaultBlockState(), BLAST_BLOCK_UPDATE_FLAGS);
             }
             edits++;
 
@@ -1923,7 +2033,7 @@ public final class ActiveNuclearBlast {
         }
         BlockPos above = ground.above();
         if (level.isEmptyBlock(above)) {
-            level.setBlock(above, BaseFireBlock.getState(level, above), UPDATE_CLIENTS_ONLY);
+            level.setBlock(above, BaseFireBlock.getState(level, above), BLAST_BLOCK_UPDATE_FLAGS);
         }
     }
 
@@ -1959,7 +2069,9 @@ public final class ActiveNuclearBlast {
             return;
         }
         try {
-            this.craterEditQueue.addAll(this.craterComputeFuture.join());
+            List<BlockEdit> edits = this.craterComputeFuture.join();
+            this.perf.craterBatchEdits += edits.size();
+            this.craterEditQueue.addAll(edits);
         } catch (CompletionException ex) {
             AtomfallMod.LOGGER.error("Atomfall crater compute failed", ex.getCause() != null ? ex.getCause() : ex);
         } finally {
@@ -1975,8 +2087,13 @@ public final class ActiveNuclearBlast {
                 continue;
             }
             try {
-                this.shockEditQueue.addAll(batch.editsFuture().join());
-                this.readyShockTargets.add(batch.targets());
+                queueShockEdits(batch.editsFuture().join());
+                List<ShockTarget> sideEffectTargets = sideEffectTargets(batch.targets());
+                this.perf.shockCompletedBatches++;
+                this.perf.shockBatchSideEffects += sideEffectTargets.size();
+                if (!sideEffectTargets.isEmpty()) {
+                    this.readyShockTargets.add(sideEffectTargets);
+                }
             } catch (CompletionException ex) {
                 AtomfallMod.LOGGER.error("Atomfall shock compute failed", ex.getCause() != null ? ex.getCause() : ex);
             } finally {
@@ -1985,11 +2102,22 @@ public final class ActiveNuclearBlast {
         }
     }
 
+    private List<ShockTarget> sideEffectTargets(List<ShockTarget> targets) {
+        List<ShockTarget> sideEffects = new ArrayList<>();
+        for (ShockTarget target : targets) {
+            if (target.sideEffects && target.needsSurface) {
+                sideEffects.add(target);
+            }
+        }
+        return sideEffects;
+    }
+
     private void processReadyShockTargets(ServerLevel level) {
         if (this.readyShockTargets.isEmpty()) {
             return;
         }
         int budget = BlastPhysicsConstants.shockBlockBudget();
+        int startBudget = budget;
         java.util.Iterator<List<ShockTarget>> batchIterator = this.readyShockTargets.iterator();
         while (batchIterator.hasNext() && budget > 0) {
             List<ShockTarget> targets = batchIterator.next();
@@ -2017,41 +2145,115 @@ public final class ActiveNuclearBlast {
                     budget -= disturbSurfaceMargins(level, target.x, target.z, target.psi, target.radial);
                 }
                 targetIterator.remove();
+                this.perf.readyProcessed++;
             }
             if (targets.isEmpty()) {
                 batchIterator.remove();
             }
         }
+        this.perf.readySpent += Math.max(0, startBudget - budget);
     }
 
     private void processDeferredEdits(ServerLevel level) {
-        if (this.deferredEdits.isEmpty()) {
+        if (this.deferredEditCount <= 0 || this.deferredChunkOrder.isEmpty()) {
             return;
         }
         int budget = BlastPhysicsConstants.shockBlockBudget() / 3;
-        java.util.Iterator<PendingEdit> iterator = this.deferredEdits.iterator();
-        while (iterator.hasNext() && budget > 0) {
-            PendingEdit edit = iterator.next();
-            BlockPos columnPos = new BlockPos(edit.x, this.origin.getY(), edit.z);
-            if (!level.hasChunkAt(columnPos)) {
+        this.perf.deferredBudget = budget;
+        int maxBucketScans = Math.min(this.deferredChunkOrder.size(), Math.max(16, budget / 2));
+        int bucketScans = 0;
+        while (!this.deferredChunkOrder.isEmpty() && budget > 0 && bucketScans < maxBucketScans) {
+            if (this.deferredChunkCursor >= this.deferredChunkOrder.size()) {
+                this.deferredChunkCursor = 0;
+            }
+
+            long chunkKey = this.deferredChunkOrder.getLong(this.deferredChunkCursor);
+            ArrayList<PendingEdit> bucket = this.deferredEditsByChunk.get(chunkKey);
+            if (bucket == null || bucket.isEmpty()) {
+                removeDeferredBucketAt(this.deferredChunkCursor, chunkKey);
                 continue;
             }
-            if (edit.structural) {
-                budget -= processStructureColumn(level, edit.x, edit.z, edit.angle, edit.radial, edit.psi);
+
+            bucketScans++;
+            this.perf.deferredBucketScanned++;
+            PendingEdit first = bucket.get(0);
+            if (!level.hasChunk(first.x >> 4, first.z >> 4)) {
+                this.perf.deferredUnloaded += bucket.size();
+                this.perf.deferredUnloadedBuckets++;
+                this.deferredChunkCursor++;
+                continue;
+            }
+
+            this.perf.deferredLoadedBuckets++;
+            while (!bucket.isEmpty() && budget > 0) {
+                PendingEdit edit = bucket.remove(bucket.size() - 1);
+                this.deferredEditKeys.remove(deferredEditKey(edit));
+                this.deferredEditCount--;
+                this.perf.deferredScanned++;
+                if (edit.structural) {
+                    budget -= processStructureColumn(level, edit.x, edit.z, edit.angle, edit.radial, edit.psi);
+                } else {
+                    budget -= processSurfaceColumn(level, edit.x, edit.z, edit.radial, edit.psi);
+                }
+                this.perf.deferredApplied++;
+            }
+
+            if (bucket.isEmpty()) {
+                removeDeferredBucketAt(this.deferredChunkCursor, chunkKey);
             } else {
-                budget -= processSurfaceColumn(level, edit.x, edit.z, edit.radial, edit.psi);
+                this.deferredChunkCursor++;
             }
-            iterator.remove();
-            this.deferredColumns.remove(BlockPos.asLong(edit.x, 0, edit.z));
         }
-        if (this.deferredEdits.size() > 50000) {
-            int removeCount = this.deferredEdits.size() - 40000;
-            for (int i = 0; i < removeCount; i++) {
-                PendingEdit edit = this.deferredEdits.get(i);
-                this.deferredColumns.remove(BlockPos.asLong(edit.x, 0, edit.z));
-            }
-            this.deferredEdits.subList(0, removeCount).clear();
+    }
+
+    private int queueDeferredColumn(int x, int z, int radial, double psi, double angle, boolean clearProcessed) {
+        int queued = 0;
+        if (queueDeferredEdit(new PendingEdit(x, z, radial, psi, angle, false), clearProcessed)) {
+            queued++;
         }
+        if (queueDeferredEdit(new PendingEdit(x, z, radial, psi, angle, true), clearProcessed)) {
+            queued++;
+        }
+        return queued;
+    }
+
+    private boolean queueDeferredEdit(PendingEdit edit, boolean clearProcessed) {
+        long editKey = deferredEditKey(edit);
+        if (!this.deferredEditKeys.add(editKey)) {
+            return false;
+        }
+        long chunkKey = deferredChunkKey(edit.x(), edit.z());
+        ArrayList<PendingEdit> bucket = this.deferredEditsByChunk.get(chunkKey);
+        if (bucket == null) {
+            bucket = new ArrayList<>();
+            this.deferredEditsByChunk.put(chunkKey, bucket);
+            this.deferredChunkOrder.add(chunkKey);
+        }
+        bucket.add(edit);
+        this.deferredEditCount++;
+        if (clearProcessed) {
+            clearProcessedFlag(edit);
+        }
+        return true;
+    }
+
+    private void removeDeferredBucketAt(int index, long chunkKey) {
+        this.deferredChunkOrder.removeLong(index);
+        this.deferredEditsByChunk.remove(chunkKey);
+        if (this.deferredChunkCursor > index) {
+            this.deferredChunkCursor--;
+        }
+        if (this.deferredChunkCursor >= this.deferredChunkOrder.size()) {
+            this.deferredChunkCursor = 0;
+        }
+    }
+
+    private static long deferredChunkKey(int x, int z) {
+        return ChunkPos.asLong(x >> 4, z >> 4);
+    }
+
+    private static long deferredEditKey(PendingEdit edit) {
+        return BlockPos.asLong(edit.x(), edit.structural() ? 1 : 0, edit.z());
     }
 
     private boolean chunkIntersectsShockRing(int chunkX, int chunkZ) {
@@ -2154,7 +2356,7 @@ public final class ActiveNuclearBlast {
         return Mth.clamp(sector, 0, this.sectorFront.length - 1);
     }
 
-    private void logShockSampling(ShockSamplingStats stats, int pendingTargets) {
+    private void logShockPerformance(ServerLevel level) {
         if (!BlastPhysicsConstants.shockPerfLogEnabled()) {
             return;
         }
@@ -2162,28 +2364,72 @@ public final class ActiveNuclearBlast {
         if (this.ageTicks % interval != 0) {
             return;
         }
-        if (stats.sampledColumns == 0 && stats.completedRings == 0 && pendingTargets == 0
-                && this.shockEditQueue.isEmpty() && this.pendingShockBatches.isEmpty()) {
+
+        ShockSamplingStats stats = this.perf.samplingStats;
+        int sampledColumns = stats == null ? 0 : stats.sampledColumns;
+        int completedRings = stats == null ? 0 : stats.completedRings;
+        int pendingTargets = this.perf.samplingTargets;
+        if (sampledColumns == 0 && completedRings == 0 && pendingTargets == 0
+                && this.shockEditQueue.isEmpty() && this.pendingShockBatches.isEmpty()
+                && this.deferredEditCount <= 0 && this.craterEditQueue.isEmpty()) {
             return;
         }
 
+        int itemEntities = countItemEntities(level);
+        long tickNanos = System.nanoTime() - this.perf.tickStartNanos;
         ShockPerformanceLog.append(
                 "Atomfall shock perf age=" + this.ageTicks
                         + " front=" + Mth.floor(this.previousAverageFront) + "/" + Mth.floor(this.averageFront)
                         + " sample=" + Mth.floor(minShockSampleFront()) + "/" + Mth.floor(maxShockFront())
+                        + " lag=" + Mth.floor(Math.max(0.0D, maxShockFront() - minShockSampleFront()))
                         + " ring=" + this.shockChunkRingStart + ".." + this.shockChunkRingEnd
-                        + " rings=" + stats.completedRings
-                        + " chunks=" + stats.chunksVisited + "/" + stats.chunksSkipped
-                        + " columns=" + stats.sampledColumns
+                        + " rings=" + completedRings
+                        + " chunks=" + (stats == null ? 0 : stats.chunksVisited) + "/" + (stats == null ? 0 : stats.chunksSkipped)
+                        + " columns=" + sampledColumns
                         + " targets=" + pendingTargets
-                        + " deferredTargets=" + stats.deferredTargets
+                        + " deferredTargets=" + (stats == null ? 0 : stats.deferredTargets)
                         + " editQueue=" + this.shockEditQueue.size()
+                        + " shockApply=" + this.perf.shockApplied + "/" + this.perf.shockScanned + "/" + this.perf.shockApplyBudget
+                        + " shockEdits=" + this.perf.shockIncomingEdits + "/" + this.perf.shockQueuedEdits + "/" + this.perf.shockReplacedEdits
                         + " batches=" + this.pendingShockBatches.size()
+                        + " batchesDone=" + this.perf.shockCompletedBatches
+                        + " sidefx=" + this.perf.shockBatchSideEffects
                         + " ready=" + readyShockTargetCount()
-                        + " deferredEdits=" + this.deferredEdits.size()
-                        + " scanLeft=" + stats.scansRemaining
-                        + " budgetLeft=" + stats.budget
+                        + " readyProc=" + this.perf.readyProcessed + "/" + this.perf.readySpent
+                        + " deferredEdits=" + this.deferredEditCount
+                        + " deferredBuckets=" + this.deferredEditsByChunk.size()
+                        + "/" + this.perf.deferredLoadedBuckets
+                        + "/" + this.perf.deferredBucketScanned
+                        + "/" + this.perf.deferredUnloadedBuckets
+                        + " deferredProc=" + this.perf.deferredApplied + "/" + this.perf.deferredScanned
+                        + "/" + this.perf.deferredUnloaded + "/" + this.perf.deferredTrimmed + "/" + this.perf.deferredBudget
+                        + " craterQueue=" + this.craterEditQueue.size()
+                        + " craterApply=" + this.perf.craterApplied + "/" + this.perf.craterScanned
+                        + " craterBatch=" + this.perf.craterBatchEdits
+                        + " collapse=" + this.perf.craterCollapseRemoved
+                        + " items=" + itemEntities
+                        + " scanLeft=" + (stats == null ? 0 : stats.scansRemaining)
+                        + " budgetLeft=" + (stats == null ? 0 : stats.budget)
+                        + " ms=" + millis(tickNanos)
+                        + "/" + millis(this.perf.craterNanos)
+                        + "/" + millis(this.perf.shockNanos)
+                        + "/" + millis(this.perf.deferredNanos)
+                        + "/" + millis(this.perf.entityNanos)
         );
+    }
+
+    private int countItemEntities(ServerLevel level) {
+        double radius = Math.min(this.geometry.shockSurfaceRadius() + 64.0D,
+                Math.max(this.geometry.craterRadius() + 64.0D, this.averageFront + 64.0D));
+        AABB bounds = new AABB(
+                this.center.x - radius, level.getMinY(), this.center.z - radius,
+                this.center.x + radius, level.getMaxY(), this.center.z + radius
+        );
+        return level.getEntitiesOfClass(ItemEntity.class, bounds).size();
+    }
+
+    private static String millis(long nanos) {
+        return String.format(Locale.ROOT, "%.2f", nanos / 1_000_000.0D);
     }
 
     private double minShockSampleFront() {
@@ -2226,6 +2472,28 @@ public final class ActiveNuclearBlast {
             }
         }
         return true;
+    }
+
+    private boolean allShockQueuesDrained() {
+        return this.deferredEditCount <= 0
+                && this.pendingShockBatches.isEmpty()
+                && this.readyShockTargets.isEmpty()
+                && this.shockEditQueue.isEmpty();
+    }
+
+    private int shockApplyBudget() {
+        int baseBudget = BlastPhysicsConstants.shockBlockBudget();
+        int queued = this.shockEditQueue.size();
+        if (queued > 250_000) {
+            return baseBudget * 4;
+        }
+        if (queued > 100_000) {
+            return baseBudget * 3;
+        }
+        if (queued > 25_000) {
+            return baseBudget * 2;
+        }
+        return baseBudget;
     }
 
     private int craterMutationBudget() {
@@ -2347,6 +2615,14 @@ public final class ActiveNuclearBlast {
                 });
     }
 
+    private List<PendingEdit> collectDeferredEdits() {
+        List<PendingEdit> edits = new ArrayList<>(this.deferredEditCount);
+        for (ArrayList<PendingEdit> bucket : this.deferredEditsByChunk.values()) {
+            edits.addAll(bucket);
+        }
+        return edits;
+    }
+
     private List<ShockTarget> collectPendingShockTargets() {
         List<ShockTarget> targets = new ArrayList<>();
         for (PendingShockBatch batch : this.pendingShockBatches) {
@@ -2364,9 +2640,7 @@ public final class ActiveNuclearBlast {
     }
 
     private void restoreDeferredEdit(PendingEdit edit) {
-        this.deferredEdits.add(edit);
-        this.deferredColumns.add(BlockPos.asLong(edit.x(), 0, edit.z()));
-        clearProcessedFlag(edit);
+        queueDeferredEdit(edit, true);
     }
 
     private void restorePendingShockTarget(ShockTarget target) {
