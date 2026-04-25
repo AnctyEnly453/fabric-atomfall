@@ -3,6 +3,7 @@ package com.codex.atomfall;
 import com.codex.atomfall.common.temperature.TemperatureSavedData;
 import com.codex.atomfall.common.temperature.TemperatureZone;
 import com.codex.atomfall.common.world.BlastPhysicsConstants;
+import com.codex.atomfall.common.world.ItemDropControl;
 import com.codex.atomfall.common.world.ShockPerformanceLog;
 import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
@@ -68,7 +69,42 @@ public final class AtomfallCommands {
                                                 .executes(AtomfallCommands::spawnHeatwaveRadiusTemp)
                                                 .then(argument("duration", IntegerArgumentType.integer(5, 3600))
                                                         .executes(AtomfallCommands::spawnHeatwaveFull)))))
+                        .then(literal("drops")
+                                .executes(AtomfallCommands::showDrops)
+                                .then(literal("off")
+                                        .executes(AtomfallCommands::disableDrops))
+                                .then(literal("on")
+                                        .executes(AtomfallCommands::enableDrops))
+                                .then(literal("status")
+                                        .executes(AtomfallCommands::showDrops)))
         ));
+    }
+
+    private static int showDrops(CommandContext<CommandSourceStack> context) {
+        context.getSource().sendSuccess(
+                () -> Component.literal("Atomfall item drops: " + (ItemDropControl.disabled() ? "off" : "on")
+                        + " | use /atomfall drops off or /atomfall drops on"),
+                false
+        );
+        return 1;
+    }
+
+    private static int disableDrops(CommandContext<CommandSourceStack> context) {
+        ItemDropControl.setDisabled(context.getSource().getServer(), true);
+        context.getSource().sendSuccess(
+                () -> Component.literal("Atomfall item drops disabled. All ItemEntity spawns are discarded; block and mob drops are also disabled."),
+                true
+        );
+        return 1;
+    }
+
+    private static int enableDrops(CommandContext<CommandSourceStack> context) {
+        ItemDropControl.setDisabled(context.getSource().getServer(), false);
+        context.getSource().sendSuccess(
+                () -> Component.literal("Atomfall item drops enabled. Vanilla block and mob drops restored."),
+                true
+        );
+        return 1;
     }
 
     private static int showPerformance(CommandContext<CommandSourceStack> context) {

@@ -4,6 +4,7 @@ import com.codex.atomfall.common.radiation.RadiationSavedData;
 import com.codex.atomfall.common.radiation.RadiationSystem;
 import com.codex.atomfall.common.temperature.TemperatureSavedData;
 import com.codex.atomfall.common.temperature.TemperatureSystem;
+import com.codex.atomfall.common.world.ItemDropControl;
 import com.codex.atomfall.common.world.NuclearBlast;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.entity.event.v1.ServerPlayerEvents;
@@ -12,6 +13,7 @@ import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
@@ -40,6 +42,11 @@ public final class AtomfallEvents {
         ServerPlayerEvents.LEAVE.register(player -> {
             RadiationSystem.removePersistentData(player);
             TemperatureSystem.removePersistentData(player);
+        });
+        ServerEntityEvents.ENTITY_LOAD.register((entity, world) -> {
+            if (entity instanceof ItemEntity item) {
+                ItemDropControl.discardIfDisabled(item);
+            }
         });
         ServerEntityEvents.ENTITY_UNLOAD.register((entity, world) -> {
             if (entity instanceof LivingEntity living && !(living instanceof Player)) {
