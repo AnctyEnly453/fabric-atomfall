@@ -1252,7 +1252,7 @@ public final class ActiveNuclearBlast {
 
         int radial = Mth.floor(distance);
         if (!chunkLoaded) {
-            int deferred = queueDeferredColumn(x, z, radial, psi, angle, false);
+            int deferred = queueDeferredFootprint(x, z, radial, psi, angle, step, minX, maxX, minZ, maxZ, stats.budget);
             if (deferred > 0) {
                 stats.deferredTargets += deferred;
                 stats.budget -= deferred;
@@ -1286,10 +1286,13 @@ public final class ActiveNuclearBlast {
 
     private void queueShockFootprint(List<ShockTarget> targets, ShockSamplingStats stats, int x, int z, int radial, double psi, double angle,
                                      int step, int minX, int maxX, int minZ, int maxZ) {
-        int cost = queueShockTarget(targets, x, z, radial, psi, angle, true, true);
-        if (cost > 0) {
-            stats.queuedTargets += cost;
-            stats.budget -= cost;
+        boolean diffuseFarField = isDiffuseFarField(radial, psi);
+        if (!diffuseFarField || shouldQueueDiffuseTerrainColumn(x, z, radial, psi, 1.0D, 0.5D)) {
+            int cost = queueShockTarget(targets, x, z, radial, psi, angle, true, true);
+            if (cost > 0) {
+                stats.queuedTargets += cost;
+                stats.budget -= cost;
+            }
         }
         if (stats.budget <= 0) {
             return;
@@ -1326,6 +1329,9 @@ public final class ActiveNuclearBlast {
                 double offsetDistance = Math.sqrt(ox * (double) ox + oz * (double) oz);
                 double falloff = 1.0D - Mth.clamp(offsetDistance / (radius + 1.15D), 0.0D, 1.0D);
                 double offsetPsi = psi * Mth.clamp(0.62D + falloff * 0.25D + edgeNoise * 0.13D, 0.54D, 0.94D);
+                if (diffuseFarField && !shouldQueueDiffuseTerrainColumn(nx, nz, radial, offsetPsi, falloff, edgeNoise)) {
+                    continue;
+                }
                 boolean includeStructural = shouldStructureBrushSample(offsetPsi, radial, ox, oz, radius, edgeNoise);
                 boolean includeSideEffects = offsetDistance <= Math.max(1.0D, radius * 0.45D) && offsetPsi >= 0.9D;
                 int brushCost = queueShockTarget(targets, nx, nz, radial, offsetPsi, angle, includeStructural, includeSideEffects);
@@ -1351,6 +1357,17 @@ public final class ActiveNuclearBlast {
             return false;
         }
         return radial <= this.geometry.shockSevereRadius() || psi >= 1.1D || noise > 0.12D;
+    }
+
+    private boolean shouldQueueDiffuseTerrainColumn(int x, int z, int radial, double psi, double brushFalloff, double edgeNoise) {
+        if (psi < 0.72D) {
+            return false;
+        }
+        double strength = diffuseFarFieldErosionStrength(x, z, radial, psi);
+        double pressure = Mth.clamp((psi - 0.45D) / 2.55D, 0.0D, 1.0D);
+        double cutoff = 0.46D - pressure * 0.12D - brushFalloff * 0.05D;
+        double grain = shockValueNoise(x * 0.73D, z * 0.73D, 619) - 0.5D;
+        return strength + edgeNoise * 0.06D + grain * 0.10D >= cutoff;
     }
 
     private int structureBrushStride(double psi, int radial) {
@@ -1740,6 +1757,21 @@ public final class ActiveNuclearBlast {
         double streak = shockRadialNoise(x, z, 59);
         double ring = shockValueNoise(radial * 0.045D, (x + z) * 0.012D, 73);
         return Mth.clamp(low * 0.46D + streak * 0.42D + ring * 0.12D, 0.0D, 1.0D);
+    }
+
+    private boolean isDiffuseFarField(int radial, double psi) {
+        return radial > this.geometry.shockSevereRadius() && psi < 3.0D;
+    }
+
+    private double diffuseFarFieldErosionStrength(int x, int z, int radial, double psi) {
+        double pressure = Mth.clamp((psi - 0.45D) / 2.55D, 0.0D, 1.0D);
+        double broad = shockValueNoise(x * 0.016D, z * 0.016D, 601);
+        double mid = shockValueNoise(x * 0.052D + radial * 0.004D, z * 0.052D, 607);
+        double streak = shockRadialNoise(x, z, 613);
+        double scallop = 1.0D - Math.abs(shockSurfacePattern(x, z, radial) - 0.54D) * 1.85D;
+        double grain = shockValueNoise(x * 0.19D, z * 0.19D, 631) - 0.5D;
+        return Mth.clamp(pressure * 0.38D + broad * 0.22D + mid * 0.16D + streak * 0.24D
+                + scallop * 0.12D + grain * 0.08D, 0.0D, 1.0D);
     }
 
     private double shockRadialNoise(int x, int z, int salt) {
@@ -2203,6 +2235,10 @@ public final class ActiveNuclearBlast {
     }
 
     private int shockScourDepth(double psi, int radial, int x, int z) {
+        if (isDiffuseFarField(radial, psi)) {
+            return diffuseFarFieldScourDepth(psi, radial, x, z);
+        }
+
         int depth = 0;
         if (psi >= 20.0D) {
             depth = 8;
@@ -2239,6 +2275,30 @@ public final class ActiveNuclearBlast {
             depth = Math.min(depth, 2);
         }
         return Mth.clamp(depth, 0, 10);
+    }
+
+    private int diffuseFarFieldScourDepth(double psi, int radial, int x, int z) {
+        if (psi < 0.75D) {
+            return 0;
+        }
+
+        double strength = diffuseFarFieldErosionStrength(x, z, radial, psi);
+        double pressure = Mth.clamp((psi - 0.75D) / 2.25D, 0.0D, 1.0D);
+        double pattern = shockSurfacePattern(x, z, radial);
+        double grain = shockValueNoise(x * 0.41D, z * 0.41D, 641);
+        double score = strength + pressure * 0.20D + (pattern - 0.5D) * 0.12D + (grain - 0.5D) * 0.08D;
+
+        int depth = 0;
+        if (score >= 0.46D) {
+            depth = 1;
+        }
+        if (psi >= 1.35D && score >= 0.59D) {
+            depth = 2;
+        }
+        if (psi >= 2.30D && score >= 0.74D) {
+            depth = 3;
+        }
+        return depth;
     }
 
     private static int shockSurfaceHash(int x, int y, int z, int salt) {
@@ -2648,12 +2708,69 @@ public final class ActiveNuclearBlast {
         }
     }
 
-    private int queueDeferredColumn(int x, int z, int radial, double psi, double angle, boolean clearProcessed) {
+    private int queueDeferredFootprint(int x, int z, int radial, double psi, double angle,
+                                       int step, int minX, int maxX, int minZ, int maxZ, int maxTargets) {
+        if (maxTargets <= 0) {
+            return 0;
+        }
+
         int queued = 0;
-        if (queueDeferredEdit(new PendingEdit(x, z, radial, psi, angle, false), clearProcessed)) {
+        boolean diffuseFarField = isDiffuseFarField(radial, psi);
+        if (!diffuseFarField || shouldQueueDiffuseTerrainColumn(x, z, radial, psi, 1.0D, 0.5D)) {
+            queued += queueDeferredTarget(x, z, radial, psi, angle, true, true, false, maxTargets - queued);
+        }
+        if (queued >= maxTargets) {
+            return queued;
+        }
+
+        int radius = shockFootprintRadius(psi, radial, step);
+        if (radius <= 0) {
+            return queued;
+        }
+
+        double dirX = Math.cos(angle);
+        double dirZ = Math.sin(angle);
+        for (int ox = -radius; ox <= radius && queued < maxTargets; ox++) {
+            for (int oz = -radius; oz <= radius && queued < maxTargets; oz++) {
+                if (ox == 0 && oz == 0) {
+                    continue;
+                }
+                double along = ox * dirX + oz * dirZ;
+                double across = -ox * dirZ + oz * dirX;
+                double alongRadius = radius + 0.75D;
+                double acrossRadius = radius * 0.72D + 0.65D;
+                double ellipse = along * along / (alongRadius * alongRadius)
+                        + across * across / (acrossRadius * acrossRadius);
+                int nx = x + ox;
+                int nz = z + oz;
+                double edgeNoise = shockValueNoise(nx * 0.37D, nz * 0.37D, 431);
+                if (ellipse > 0.96D + edgeNoise * 0.26D || nx < minX || nx > maxX || nz < minZ || nz > maxZ) {
+                    continue;
+                }
+
+                double offsetDistance = Math.sqrt(ox * (double) ox + oz * (double) oz);
+                double falloff = 1.0D - Mth.clamp(offsetDistance / (radius + 1.15D), 0.0D, 1.0D);
+                double offsetPsi = psi * Mth.clamp(0.62D + falloff * 0.25D + edgeNoise * 0.13D, 0.54D, 0.94D);
+                boolean includeSurface = !diffuseFarField || shouldQueueDiffuseTerrainColumn(nx, nz, radial, offsetPsi, falloff, edgeNoise);
+                boolean includeStructural = shouldStructureBrushSample(offsetPsi, radial, ox, oz, radius, edgeNoise);
+                if (!includeSurface && !includeStructural) {
+                    continue;
+                }
+                queued += queueDeferredTarget(nx, nz, radial, offsetPsi, angle, includeSurface, includeStructural, false, maxTargets - queued);
+            }
+        }
+        return queued;
+    }
+
+    private int queueDeferredTarget(int x, int z, int radial, double psi, double angle, boolean includeSurface,
+                                    boolean includeStructural, boolean clearProcessed, int maxTargets) {
+        int queued = 0;
+        if (includeSurface && queued < maxTargets
+                && queueDeferredEdit(new PendingEdit(x, z, radial, psi, angle, false), clearProcessed)) {
             queued++;
         }
-        if (queueDeferredEdit(new PendingEdit(x, z, radial, psi, angle, true), clearProcessed)) {
+        if (includeStructural && queued < maxTargets
+                && queueDeferredEdit(new PendingEdit(x, z, radial, psi, angle, true), clearProcessed)) {
             queued++;
         }
         return queued;
@@ -2751,6 +2868,11 @@ public final class ActiveNuclearBlast {
     private int shockFootprintRadius(double psi, int radial, int step) {
         if (step <= 0 || psi < 0.45D) {
             return 0;
+        }
+
+        if (isDiffuseFarField(radial, psi)) {
+            int diffuseRadius = psi >= 0.75D ? Math.max(3, step + 1) : Math.max(2, step);
+            return Math.min(diffuseRadius, 4);
         }
 
         int radius = Math.max(2, step);
