@@ -907,7 +907,8 @@ public final class ActiveNuclearBlast {
     }
 
     private static double smoothstep(double value) {
-        return value * value * (3.0D - 2.0D * value);
+        double t = Mth.clamp(value, 0.0D, 1.0D);
+        return t * t * (3.0D - 2.0D * t);
     }
 
     private static int craterFloorJitter(int x, int z, double normalized) {
@@ -1299,7 +1300,7 @@ public final class ActiveNuclearBlast {
         }
 
         int radial = Mth.floor(distance);
-        if (shouldSkipLowValueShockSample(x, z, radial, psi, step)) {
+        if (shouldSkipLowValueShockSample(x, z, radial, psi, step, chunkLoaded)) {
             return;
         }
         if (!chunkLoaded) {
@@ -1314,8 +1315,12 @@ public final class ActiveNuclearBlast {
         queueShockFootprint(targets, stats, x, z, radial, psi, angle, step, minX, maxX, minZ, maxZ);
     }
 
-    private boolean shouldSkipLowValueShockSample(int x, int z, int radial, double psi, int step) {
+    private boolean shouldSkipLowValueShockSample(int x, int z, int radial, double psi, int step, boolean chunkLoaded) {
         if (radial <= this.geometry.shockSevereRadius() || psi >= 2.0D) {
+            return false;
+        }
+        if (chunkLoaded && psi >= 0.75D && this.shockEditQueue.size() <= SHOCK_QUEUE_HARD_BACKPRESSURE
+                && this.perf.frontLag <= 900.0D) {
             return false;
         }
 
@@ -1358,11 +1363,17 @@ public final class ActiveNuclearBlast {
 
     private void queueShockFootprint(List<ShockTarget> targets, ShockSamplingStats stats, int x, int z, int radial, double psi, double angle,
                                      int step, int minX, int maxX, int minZ, int maxZ) {
-        boolean diffuseFarField = isDiffuseFarField(radial, psi);
+        double diffuseBlend = diffuseFieldBlend(radial, psi);
+        boolean diffuseSurfaceField = diffuseBlend > 0.02D;
+        boolean diffuseStructureField = diffuseBlend >= 0.58D;
         boolean stressed = isShockQueueStressed();
+        int radius = loadedShockFootprintRadius(psi, radial, step);
         boolean centerStructural = !stressed || radial <= this.geometry.shockSevereRadius() * 1.18D || psi >= 1.25D;
-        if (!diffuseFarField || shouldQueueDiffuseTerrainColumn(x, z, radial, psi, 1.0D, 0.5D)) {
-            int cost = queueShockTarget(targets, x, z, radial, psi, angle, centerStructural, !stressed);
+        boolean centerSurface = !diffuseSurfaceField || shouldQueueDiffuseSurfaceColumn(x, z, radial, psi, 1.0D, 0.5D, diffuseBlend);
+        boolean centerStructure = centerStructural && (!diffuseStructureField || shouldQueueDiffuseStructureColumn(x, z, radial, psi, 1.0D, 0.5D, diffuseBlend));
+        if (centerSurface || centerStructure) {
+            boolean centerSideEffects = shouldQueueShockSideEffects(stressed, radial, psi, 0.0D, Math.max(2, radius), diffuseBlend);
+            int cost = queueShockTarget(targets, x, z, radial, psi, angle, centerSurface, centerStructure, centerSideEffects);
             if (cost > 0) {
                 stats.queuedTargets += cost;
                 stats.budget -= cost;
@@ -1372,7 +1383,6 @@ public final class ActiveNuclearBlast {
             return;
         }
 
-        int radius = shockFootprintRadius(psi, radial, step);
         if (radius <= 0) {
             return;
         }
@@ -1386,12 +1396,13 @@ public final class ActiveNuclearBlast {
                 }
                 double along = ox * dirX + oz * dirZ;
                 double across = -ox * dirZ + oz * dirX;
-                double alongRadius = radius + 0.75D;
-                double acrossRadius = radius * 0.72D + 0.65D;
+                double alongRadius = radius + Mth.lerp(diffuseBlend, 0.75D, 1.50D);
+                double acrossRadius = radius * Mth.lerp(diffuseBlend, 0.72D, 0.92D) + 0.65D;
                 double ellipse = along * along / (alongRadius * alongRadius)
                         + across * across / (acrossRadius * acrossRadius);
                 double edgeNoise = shockValueNoise((x + ox) * 0.37D, (z + oz) * 0.37D, 431);
-                if (ellipse > 0.96D + edgeNoise * 0.26D) {
+                double edgeLimit = Mth.lerp(diffuseBlend, 0.96D + edgeNoise * 0.26D, 1.04D + edgeNoise * 0.16D);
+                if (ellipse > edgeLimit) {
                     continue;
                 }
 
@@ -1403,15 +1414,17 @@ public final class ActiveNuclearBlast {
                 double offsetDistance = Math.sqrt(ox * (double) ox + oz * (double) oz);
                 double falloff = 1.0D - Mth.clamp(offsetDistance / (radius + 1.15D), 0.0D, 1.0D);
                 double offsetPsi = psi * Mth.clamp(0.62D + falloff * 0.25D + edgeNoise * 0.13D, 0.54D, 0.94D);
-                if (diffuseFarField && !shouldQueueDiffuseTerrainColumn(nx, nz, radial, offsetPsi, falloff, edgeNoise)) {
-                    continue;
-                }
-                boolean includeStructural = shouldStructureBrushSample(offsetPsi, radial, ox, oz, radius, edgeNoise);
-                if (stressed && radial > this.geometry.shockSevereRadius() && offsetPsi < 1.35D) {
+                boolean includeSurface = !diffuseSurfaceField || shouldQueueDiffuseSurfaceColumn(nx, nz, radial, offsetPsi, falloff, edgeNoise, diffuseBlend);
+                boolean includeStructural = shouldStructureBrushSample(offsetPsi, radial, ox, oz, radius, edgeNoise)
+                        && (!diffuseStructureField || shouldQueueDiffuseStructureColumn(nx, nz, radial, offsetPsi, falloff, edgeNoise, diffuseBlend));
+                if (stressed && diffuseBlend > 0.72D && offsetPsi < 1.10D) {
                     includeStructural = false;
                 }
-                boolean includeSideEffects = !stressed && offsetDistance <= Math.max(1.0D, radius * 0.45D) && offsetPsi >= 0.9D;
-                int brushCost = queueShockTarget(targets, nx, nz, radial, offsetPsi, angle, includeStructural, includeSideEffects);
+                if (!includeSurface && !includeStructural) {
+                    continue;
+                }
+                boolean includeSideEffects = shouldQueueShockSideEffects(stressed, radial, offsetPsi, offsetDistance, radius, diffuseBlend);
+                int brushCost = queueShockTarget(targets, nx, nz, radial, offsetPsi, angle, includeSurface, includeStructural, includeSideEffects);
                 if (brushCost > 0) {
                     stats.queuedTargets += brushCost;
                     stats.budget -= brushCost;
@@ -1450,6 +1463,56 @@ public final class ActiveNuclearBlast {
         return strength + edgeNoise * 0.06D + grain * 0.10D >= cutoff;
     }
 
+    private boolean shouldQueueDiffuseStructureColumn(int x, int z, int radial, double psi, double brushFalloff,
+                                                      double edgeNoise, double diffuseBlend) {
+        if (psi < MIN_STRUCTURE_SHOCK_PSI) {
+            return false;
+        }
+        if (diffuseBlend <= 0.58D) {
+            return true;
+        }
+
+        double fade = smoothstep((diffuseBlend - 0.58D) / 0.42D);
+        double strength = diffuseFarFieldErosionStrength(x, z, radial, psi);
+        double pressure = Mth.clamp((psi - MIN_STRUCTURE_SHOCK_PSI) / 2.1D, 0.0D, 1.0D);
+        double cutoff = Mth.lerp(fade, 0.26D, 0.48D) - pressure * 0.16D - brushFalloff * 0.08D;
+        double grain = shockValueNoise(x * 0.49D, z * 0.49D, 659) - 0.5D;
+        return strength + edgeNoise * 0.05D + grain * 0.08D >= cutoff;
+    }
+
+    private boolean shouldQueueDiffuseSurfaceColumn(int x, int z, int radial, double psi, double brushFalloff,
+                                                    double edgeNoise, double diffuseBlend) {
+        if (psi < 0.72D) {
+            return false;
+        }
+        if (diffuseBlend <= 0.18D) {
+            return true;
+        }
+        double coreFalloff = Mth.lerp(diffuseBlend, 0.04D, 0.18D);
+        if (psi >= 0.82D && brushFalloff >= coreFalloff) {
+            return true;
+        }
+
+        double strength = diffuseFarFieldErosionStrength(x, z, radial, psi);
+        double pressure = Mth.clamp((psi - 0.62D) / 2.38D, 0.0D, 1.0D);
+        double cutoff = Mth.lerp(diffuseBlend, 0.18D, 0.31D) - pressure * 0.12D - brushFalloff * 0.12D;
+        double grain = shockValueNoise(x * 0.57D, z * 0.57D, 643) - 0.5D;
+        return strength + edgeNoise * 0.04D + grain * 0.06D >= cutoff;
+    }
+
+    private boolean shouldQueueShockSideEffects(boolean stressed, int radial, double psi, double offsetDistance,
+                                                int radius, double diffuseBlend) {
+        if (stressed) {
+            return false;
+        }
+        double sideRadius = Math.max(1.0D, radius * Mth.lerp(diffuseBlend, 0.58D, 0.38D));
+        double threshold = Mth.lerp(diffuseBlend, 0.70D, 1.05D);
+        if (radial <= this.geometry.shockSevereRadius() * 1.12D) {
+            threshold = Math.min(threshold, 0.78D);
+        }
+        return offsetDistance <= sideRadius && psi >= threshold;
+    }
+
     private int structureBrushStride(double psi, int radial) {
         if (radial <= this.geometry.shockCoreRadius() || psi >= 4.5D) {
             return 1;
@@ -1461,12 +1524,12 @@ public final class ActiveNuclearBlast {
     }
 
     private int queueShockTarget(List<ShockTarget> targets, int x, int z, int radial, double psi, double angle,
-                                 boolean includeStructural, boolean sideEffects) {
+                                 boolean includeSurface, boolean includeStructural, boolean sideEffects) {
         long surfKey = BlockPos.asLong(x, 0, z);
         long structKey = BlockPos.asLong(x, 1, z);
         double prevSurfacePsi = this.processedSurfaceColumns.getOrDefault(surfKey, -1.0D);
         double prevStructPsi = this.processedStructureColumns.getOrDefault(structKey, -1.0D);
-        boolean needsSurface = shouldRetouchColumn(psi, prevSurfacePsi, MIN_SURFACE_SHOCK_PSI, surfaceRetouchPsiStep(psi, radial));
+        boolean needsSurface = includeSurface && shouldRetouchColumn(psi, prevSurfacePsi, MIN_SURFACE_SHOCK_PSI, surfaceRetouchPsiStep(psi, radial));
         boolean needsStructural = includeStructural && shouldRetouchColumn(psi, prevStructPsi, MIN_STRUCTURE_SHOCK_PSI, structureRetouchPsiStep(psi, radial));
         if (!needsSurface && !needsStructural) {
             return 0;
@@ -1495,6 +1558,11 @@ public final class ActiveNuclearBlast {
         }
         if (radial <= this.geometry.shockSevereRadius() || psi >= 2.0D) {
             return 0.55D;
+        }
+        double diffuseBlend = diffuseFieldBlend(radial, psi);
+        if (diffuseBlend > 0.0D) {
+            double diffuseStep = psi >= 1.2D ? 0.30D : 0.24D;
+            return Mth.lerp(diffuseBlend, 0.65D, diffuseStep);
         }
         return 0.65D;
     }
@@ -1951,7 +2019,15 @@ public final class ActiveNuclearBlast {
     }
 
     private boolean isDiffuseFarField(int radial, double psi) {
-        return radial > this.geometry.shockSevereRadius() && psi < 3.0D;
+        return diffuseFieldBlend(radial, psi) >= 0.50D;
+    }
+
+    private double diffuseFieldBlend(int radial, double psi) {
+        double severeRadius = this.geometry.shockSevereRadius();
+        double transitionWidth = Math.max(180.0D, this.geometry.cubeRootScale() * 130.0D);
+        double radialBlend = smoothstep((radial - (severeRadius - transitionWidth * 0.45D)) / transitionWidth);
+        double pressureBlend = 1.0D - smoothstep((psi - 2.05D) / 1.35D);
+        return radialBlend * pressureBlend;
     }
 
     private double diffuseFarFieldErosionStrength(int x, int z, int radial, double psi) {
@@ -2432,10 +2508,16 @@ public final class ActiveNuclearBlast {
     }
 
     private int shockScourDepth(double psi, int radial, int x, int z) {
-        if (isDiffuseFarField(radial, psi)) {
-            return diffuseFarFieldScourDepth(psi, radial, x, z);
+        double diffuseBlend = diffuseFieldBlend(radial, psi);
+        int depth = normalShockScourDepth(psi, radial, x, z);
+        if (diffuseBlend > 0.0D) {
+            int diffuseDepth = diffuseFarFieldScourDepth(psi, radial, x, z);
+            return Mth.clamp(Mth.floor(Mth.lerp(diffuseBlend, depth, diffuseDepth) + 0.35D), 0, 14);
         }
+        return depth;
+    }
 
+    private int normalShockScourDepth(double psi, int radial, int x, int z) {
         int depth = 0;
         if (psi >= 20.0D) {
             depth = 8;
@@ -2793,7 +2875,8 @@ public final class ActiveNuclearBlast {
                 }
                 int surfaceY = this.initialSurface.getOrCapture(level, target.x, target.z);
                 BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos(target.x, surfaceY, target.z);
-                if (target.psi >= 3.0D && level.getBlockState(pos).getFluidState().is(FluidTags.WATER)) {
+                if (target.psi >= shockWaterEvaporationPsiThreshold(target.radial)
+                        && level.getBlockState(pos).getFluidState().is(FluidTags.WATER)) {
                     BlockPos waterSeed = WaterEvaporationUtil.findWaterSeed(level, target.x, target.z, 24);
                     if (waterSeed != null) {
                         flashBoilWater(level, waterSeed, target.psi);
@@ -2815,6 +2898,12 @@ public final class ActiveNuclearBlast {
             }
         }
         this.perf.readySpent += Math.max(0, startBudget - budget);
+    }
+
+    private double shockWaterEvaporationPsiThreshold(int radial) {
+        double severeRadius = this.geometry.shockSevereRadius();
+        double blend = smoothstep((radial - severeRadius * 0.45D) / Math.max(1.0D, severeRadius * 0.75D));
+        return Mth.lerp(blend, 2.65D, 1.05D);
     }
 
     private static final int DEFERRED_MAX_BUCKETS_PER_TICK = 4;
@@ -3159,6 +3248,28 @@ public final class ActiveNuclearBlast {
         return Math.min(radius, radial <= this.geometry.shockSevereRadius() ? 6 : 4);
     }
 
+    private int loadedShockFootprintRadius(double psi, int radial, int step) {
+        int radius = Math.min(baseShockFootprintRadius(psi, radial, step), 6);
+        double diffuseBlend = diffuseFieldBlend(radial, psi);
+        if (diffuseBlend <= 0.0D) {
+            return radius;
+        }
+        int denseRadius = psi >= 1.15D ? Math.max(7, step / 2 + 6) : Math.max(6, step / 2 + 5);
+        int blended = Mth.floor(Mth.lerp(diffuseBlend, radius, denseRadius) + 0.5D);
+        return Math.min(Math.max(blended, radius), psi >= 1.15D ? 14 : 12);
+    }
+
+    private int baseShockFootprintRadius(double psi, int radial, int step) {
+        int radius = Math.max(2, step);
+        if (radial <= this.geometry.shockCoreRadius()
+                || psi >= 8.0D && radial <= this.geometry.shockSevereRadius()) {
+            radius += 2;
+        } else if (radial <= this.geometry.shockSevereRadius() || psi >= 2.0D) {
+            radius++;
+        }
+        return radius;
+    }
+
     private int shockChunkColumnStep(double radius) {
         int stride = shellStride(radius);
         int pressureStep = shockSamplingPressureStep();
@@ -3168,7 +3279,7 @@ public final class ActiveNuclearBlast {
         if (radius <= 700.0D) {
             return Math.max(5, stride + pressureStep);
         }
-        return Math.min(24, Math.max(8, stride + pressureStep + 2));
+        return Math.min(16, Math.max(8, stride + pressureStep + 2));
     }
 
     private int shockSamplingPressureStep() {
