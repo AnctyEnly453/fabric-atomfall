@@ -1238,7 +1238,8 @@ public final class ActiveNuclearBlast {
     }
 
     private boolean processShockChunkColumns(ServerLevel level, List<ShockTarget> targets, ShockSamplingStats stats, int chunkX, int chunkZ) {
-        int step = shockChunkColumnStep((this.shockChunkRingStart + this.shockChunkRingEnd) * 0.5D);
+        boolean chunkLoaded = level.hasChunk(chunkX, chunkZ);
+        int step = shockChunkColumnStep((this.shockChunkRingStart + this.shockChunkRingEnd) * 0.5D, chunkLoaded);
         int minX = chunkX << 4;
         int minZ = chunkZ << 4;
         int maxX = minX + 15;
@@ -1256,7 +1257,6 @@ public final class ActiveNuclearBlast {
             return true;
         }
 
-        boolean chunkLoaded = level.hasChunk(chunkX, chunkZ);
         while (this.shockChunkBlockX <= maxX && stats.canContinue()) {
             while (this.shockChunkBlockZ <= maxZ && stats.canContinue()) {
                 stats.scansRemaining--;
@@ -1319,8 +1319,8 @@ public final class ActiveNuclearBlast {
         if (radial <= this.geometry.shockSevereRadius() || psi >= 2.0D) {
             return false;
         }
-        if (chunkLoaded && psi >= 0.75D && this.shockEditQueue.size() <= SHOCK_QUEUE_HARD_BACKPRESSURE
-                && this.perf.frontLag <= 900.0D) {
+        if (chunkLoaded && psi >= 0.45D && this.shockEditQueue.size() <= SHOCK_QUEUE_TRIM_THRESHOLD
+                && this.perf.frontLag <= 1200.0D) {
             return false;
         }
 
@@ -3249,14 +3249,14 @@ public final class ActiveNuclearBlast {
     }
 
     private int loadedShockFootprintRadius(double psi, int radial, int step) {
-        int radius = Math.min(baseShockFootprintRadius(psi, radial, step), 6);
+        int radius = Math.min(baseShockFootprintRadius(psi, radial, step), 5);
         double diffuseBlend = diffuseFieldBlend(radial, psi);
         if (diffuseBlend <= 0.0D) {
             return radius;
         }
-        int denseRadius = psi >= 1.15D ? Math.max(7, step / 2 + 6) : Math.max(6, step / 2 + 5);
+        int denseRadius = psi >= 1.15D ? Math.max(4, step + 3) : Math.max(3, step + 2);
         int blended = Mth.floor(Mth.lerp(diffuseBlend, radius, denseRadius) + 0.5D);
-        return Math.min(Math.max(blended, radius), psi >= 1.15D ? 14 : 12);
+        return Math.min(Math.max(blended, radius), psi >= 1.15D ? 8 : 7);
     }
 
     private int baseShockFootprintRadius(double psi, int radial, int step) {
@@ -3270,9 +3270,19 @@ public final class ActiveNuclearBlast {
         return radius;
     }
 
-    private int shockChunkColumnStep(double radius) {
+    private int shockChunkColumnStep(double radius, boolean chunkLoaded) {
         int stride = shellStride(radius);
         int pressureStep = shockSamplingPressureStep();
+        if (chunkLoaded) {
+            if (radius <= 220.0D) {
+                return Math.max(1, stride / 2 + pressureStep / 6);
+            }
+            if (radius <= 700.0D) {
+                return Math.max(2, stride / 3 + pressureStep / 5);
+            }
+            return Math.min(6, Math.max(2, stride / 4 + pressureStep / 4));
+        }
+
         if (radius <= 220.0D) {
             return Math.max(2, stride + Math.max(0, pressureStep - 2));
         }
