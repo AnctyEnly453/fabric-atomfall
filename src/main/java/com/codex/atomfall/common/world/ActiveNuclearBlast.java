@@ -226,9 +226,13 @@ public final class ActiveNuclearBlast {
     }
 
     private record BlockEdit(long packedPos, BlockState newState, boolean remove) {
+        boolean isChunkLoaded(ServerLevel level) {
+            return level.hasChunk(BlockPos.getX(this.packedPos) >> 4, BlockPos.getZ(this.packedPos) >> 4);
+        }
+
         boolean apply(ServerLevel level, BlockPos.MutableBlockPos mutable) {
             mutable.set(BlockPos.getX(this.packedPos), BlockPos.getY(this.packedPos), BlockPos.getZ(this.packedPos));
-            if (!level.hasChunk(mutable.getX() >> 4, mutable.getZ() >> 4)) {
+            if (!isChunkLoaded(level)) {
                 return false;
             }
             BlockState current = level.getBlockState(mutable);
@@ -1514,19 +1518,49 @@ public final class ActiveNuclearBlast {
         BlockPos.MutableBlockPos mutable = new BlockPos.MutableBlockPos();
         int applied = 0;
         int scanned = 0;
-        while (applied < budget && scanned < maxScans && !this.shockEditQueue.isEmpty()) {
+        int index = this.shockEditQueue.size() - 1;
+        boolean rebuildIndexes = false;
+        ArrayList<BlockEdit> unloadedEdits = null;
+        while (applied < budget && scanned < maxScans && index >= 0) {
             if ((scanned & 31) == 0 && System.nanoTime() > deadline) {
                 break;
             }
-            BlockEdit edit = this.shockEditQueue.remove(this.shockEditQueue.size() - 1);
+            BlockEdit edit = this.shockEditQueue.get(index);
+            if (!edit.isChunkLoaded(level)) {
+                if (unloadedEdits == null) {
+                    unloadedEdits = new ArrayList<>();
+                }
+                unloadedEdits.add(this.shockEditQueue.remove(index));
+                rebuildIndexes = true;
+                scanned++;
+                index--;
+                continue;
+            }
+
+            this.shockEditQueue.remove(index);
             this.queuedShockEditIndexes.remove(edit.packedPos());
             if (edit.apply(level, mutable)) {
                 applied++;
             }
+            rebuildIndexes |= index < this.shockEditQueue.size();
             scanned++;
+            index--;
+        }
+        if (unloadedEdits != null) {
+            this.shockEditQueue.addAll(0, unloadedEdits);
+        }
+        if (rebuildIndexes) {
+            rebuildShockEditIndexes();
         }
         this.perf.shockApplied += applied;
         this.perf.shockScanned += scanned;
+    }
+
+    private void rebuildShockEditIndexes() {
+        this.queuedShockEditIndexes.clear();
+        for (int i = 0; i < this.shockEditQueue.size(); i++) {
+            this.queuedShockEditIndexes.put(this.shockEditQueue.get(i).packedPos(), i);
+        }
     }
 
     private void trimShockQueueUnderBackpressure() {
@@ -2244,10 +2278,7 @@ public final class ActiveNuclearBlast {
         int openSides = 0;
         for (Direction direction : HORIZONTAL) {
             BlockPos neighbor = pos.relative(direction);
-            if (!level.hasChunk(neighbor.getX() >> 4, neighbor.getZ() >> 4)) {
-                continue;
-            }
-            if (level.getBlockState(neighbor).isAir()) {
+            if (isLoadedAir(level, neighbor)) {
                 openSides++;
             }
         }
@@ -2307,7 +2338,7 @@ public final class ActiveNuclearBlast {
     private static int openSideCount(ServerLevel level, BlockPos pos) {
         int openSides = 0;
         for (Direction direction : HORIZONTAL) {
-            if (level.getBlockState(pos.relative(direction)).isAir()) {
+            if (isLoadedAir(level, pos.relative(direction))) {
                 openSides++;
             }
         }
@@ -2319,13 +2350,17 @@ public final class ActiveNuclearBlast {
         Direction primary = Math.abs(dirX) > Math.abs(dirZ)
                 ? (dirX > 0 ? Direction.EAST : Direction.WEST)
                 : (dirZ > 0 ? Direction.SOUTH : Direction.NORTH);
-        if (level.getBlockState(pos.relative(primary)).isAir()) {
+        if (isLoadedAir(level, pos.relative(primary))) {
             openSides++;
         }
-        if (level.getBlockState(pos.relative(primary.getOpposite())).isAir()) {
+        if (isLoadedAir(level, pos.relative(primary.getOpposite()))) {
             openSides++;
         }
         return openSides;
+    }
+
+    private static boolean isLoadedAir(ServerLevel level, BlockPos pos) {
+        return level.hasChunk(pos.getX() >> 4, pos.getZ() >> 4) && level.getBlockState(pos).isAir();
     }
 
     private double structureRequiredPsi(BlockState state, int openSides, boolean openAbove) {
@@ -2558,19 +2593,30 @@ public final class ActiveNuclearBlast {
     }
 
     private void damageEntities(ServerLevel level) {
-        double min = this.previousAverageFront - shellWidth(this.previousAverageFront);
-        double max = this.averageFront + shellWidth(this.averageFront);
+        double max = maxSectorFrontWithShellWidth();
         AABB bounds = new AABB(
                 this.center.x - max, this.center.y - 24.0D, this.center.z - max,
                 this.center.x + max, this.center.y + 64.0D, this.center.z + max
         );
 
         for (LivingEntity entity : level.getEntitiesOfClass(LivingEntity.class, bounds)) {
-            double distance = entity.position().distanceTo(this.center);
-            if (distance < min || distance > max) {
+            Vec3 entityPos = entity.position();
+            double dx = entityPos.x - this.center.x;
+            double dz = entityPos.z - this.center.z;
+            double horizontalDistance = Math.sqrt(dx * dx + dz * dz);
+            if (horizontalDistance <= 0.0001D) {
                 continue;
             }
-            double psi = this.geometry.peakOverpressurePsi(distance);
+
+            int sector = sectorForAngle(Math.atan2(dz, dx));
+            double previousFront = this.previousSectorFront[sector];
+            double currentFront = this.sectorFront[sector];
+            double min = previousFront - shellWidth(previousFront);
+            double sectorMax = currentFront + shellWidth(currentFront);
+            if (horizontalDistance < min || horizontalDistance > sectorMax) {
+                continue;
+            }
+            double psi = this.geometry.peakOverpressurePsi(horizontalDistance) * this.sectorEnergy[sector];
             if (psi < 0.25D) {
                 continue;
             }
@@ -2594,6 +2640,14 @@ public final class ActiveNuclearBlast {
                 playShockArrivalForPlayer(player, effectivePsi);
             }
         }
+    }
+
+    private double maxSectorFrontWithShellWidth() {
+        double max = 0.0D;
+        for (float front : this.sectorFront) {
+            max = Math.max(max, front + shellWidth(front));
+        }
+        return max;
     }
 
     private void playShockArrivalForPlayer(ServerPlayer player, double effectivePsi) {
@@ -2968,6 +3022,7 @@ public final class ActiveNuclearBlast {
     private boolean queueDeferredEdit(PendingEdit edit, boolean clearProcessed) {
         long editKey = deferredEditKey(edit);
         if (!this.deferredEditKeys.add(editKey)) {
+            replaceDeferredEditIfStronger(editKey, edit, clearProcessed);
             return false;
         }
         long chunkKey = deferredChunkKey(edit.x(), edit.z());
@@ -2983,6 +3038,33 @@ public final class ActiveNuclearBlast {
             clearProcessedFlag(edit);
         }
         return true;
+    }
+
+    private void replaceDeferredEditIfStronger(long editKey, PendingEdit edit, boolean clearProcessed) {
+        long chunkKey = deferredChunkKey(edit.x(), edit.z());
+        ArrayList<PendingEdit> bucket = this.deferredEditsByChunk.get(chunkKey);
+        if (bucket == null) {
+            this.deferredEditKeys.remove(editKey);
+            queueDeferredEdit(edit, clearProcessed);
+            return;
+        }
+
+        for (int i = 0; i < bucket.size(); i++) {
+            PendingEdit existing = bucket.get(i);
+            if (deferredEditKey(existing) != editKey) {
+                continue;
+            }
+            if (edit.psi() > existing.psi()) {
+                bucket.set(i, edit);
+            }
+            if (clearProcessed) {
+                clearProcessedFlag(edit);
+            }
+            return;
+        }
+
+        this.deferredEditKeys.remove(editKey);
+        queueDeferredEdit(edit, clearProcessed);
     }
 
     private void removeDeferredBucketAt(int index, long chunkKey) {
